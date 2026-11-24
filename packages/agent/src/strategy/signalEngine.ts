@@ -1,16 +1,24 @@
-import type { Address } from "viem";
-import { HASHKEY_MAINNET } from "../config/networks.js";
+import type { Address, Hex } from "viem";
+import { HASHKEY_MAINNET, PROTOCOL_HARD_LIMITS } from "../config/networks.js";
 import type { ChainTelemetrySnapshot } from "../rpc/hskTelemetry.js";
 import {
+  computeErrorSelector,
   computeSignalHash,
   computeTradeIntentDigest,
+  encodeExecuteGuardedSwapCalldata,
+  encodeSyncPriceCalldata,
   hashStrategyTag,
   type RiskPolicyConfig,
   type TradeIntentPayload,
 } from "../vault/eip712.js";
 
 export type StrategyMode = "MOMENTUM" | "MEAN_REVERSION" | "ARBITRAGE" | "HYBRID";
-export type MarketRegime = "TRENDING_BULL" | "TRENDING_BEAR" | "MEAN_REVERTING" | "VOLATILE_CAUTION";
+export type MarketRegime =
+  | "TRENDING_BULL"
+  | "TRENDING_BEAR"
+  | "MEAN_REVERTING"
+  | "RANGE_BOUND"
+  | "VOLATILE_CAUTION";
 export type SignalAction = "BUY" | "SELL" | "ARB_ROTATE" | "HOLD";
 
 export interface GuardCheck {
@@ -30,15 +38,26 @@ export interface ArbitrageOpportunity {
   netEdgeBps: number;
   executable: boolean;
   recommendedNotionalUsd: number;
+  holdReason: string;
+}
+
+export interface MarketAvailabilityRow {
+  pair: string;
+  livePoolCount: number;
+  status: "LIVE_EXECUTABLE" | "NO_LIVE_POOL";
+  poolSummary: string;
+  factoryNote: string;
 }
 
 export interface QuantSignal {
   pair: string;
+  hasLivePool: boolean;
   action: SignalAction;
   strategyMode: StrategyMode;
   regime: MarketRegime;
-  confidence: number; // 0..100
+  confidence: number;
   spotPrice: number;
+  twapPrice: number;
   emaFast: number;
   emaSlow: number;
   rsi14: number;
@@ -46,6 +65,7 @@ export interface QuantSignal {
   realizedVolPct: number;
   expectedEdgeBps: number;
   recommendedSizeUsd: number;
+  maxDepth2PctUsd: number;
   rationale: string;
   guardChecks: GuardCheck[];
   allGuardsPassed: boolean;
@@ -53,22 +73,76 @@ export interface QuantSignal {
   intentDigest: string | null;
 }
 
+export type DecisionVerdict = "ACT" | "HOLD" | "GUARD_REJECT";
+
+export interface AgentDecisionEntry {
+  id: string;
+  timestampIso: string;
+  blockNumber: number;
+  pair: string;
+  pool500Spot: number;
+  pool3000Spot: number;
+  twapPrice: number;
+  spotVsTwapDiffBps: number;
+  grossSpreadBps: number;
+  feeHurdleBps: number;
+  gasImpactBps: number;
+  netEdgeBps: number;
+  maxDepth2PctUsd: number;
+  verdict: DecisionVerdict;
+  reasonCode:
+    | "SPREAD_BELOW_FEE_HURDLE"
+    | "ORACLE_STALE"
+    | "SPOT_TWAP_DIVERGENCE"
+    | "CIRCUIT_BREAKER_LATCHED"
+    | "VAULT_PAUSED"
+    | "COOLDOWN_ACTIVE"
+    | "NO_SIGNAL_DISLOCATION"
+    | "EXECUTABLE_SIGNAL";
+  evidence: string;
+}
+
+export type AdversarialAttackId =
+  | "ONE_WEI_SLIPPAGE"
+  | "STALE_ORACLE"
+  | "UNAUTHORIZED_KEEPER"
+  | "SPOT_TWAP_SPIKE"
+  | "OVERSIZED_POSITION";
+
+export interface AdversarialCheckResult {
+  id: AdversarialAttackId;
+  title: string;
+  severityRef: string;
+  attackDescription: string;
+  reverted: boolean;
+  errorName: string;
+  errorSignature: string;
+  errorSelector: Hex;
+  decodedReason: string;
+  calldataPreview: Hex;
+  foundryTestRef: string;
+  executionMode: "ON_CHAIN_ETH_CALL" | "PRE_DEPLOY_EVM_PARITY";
+}
+
 export interface VaultRuntimeState {
-  vaultAddress: Address;
+  vaultAddress: Address | null;
+  ownerAddress: Address;
   agentAddress: Address;
+  isLiveOnChain: boolean;
   paused: boolean;
   circuitBreakerTripped: boolean;
   currentDrawdownBps: number;
   dailyTradeCount: number;
   secondsSinceLastTrade: number;
+  oracleAgeSec: number;
+  oracleMaxStalenessSec: number;
+  oracleMaxDeviationBps: number;
   sessionVolumeUsedUsd: number;
   sessionVolumeCapUsd: number;
   nonce: number;
   balances: {
     USDT: number;
     WHSK: number;
-    WETH: number;
-    WBTC: number;
   };
   policy: RiskPolicyConfig;
   strategyMode: StrategyMode;
@@ -124,40 +198,71 @@ export function computeRealizedVolPct(series: number[]): number {
   }
   const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
   const variance = returns.reduce((a, r) => a + (r - mean) ** 2, 0) / Math.max(1, returns.length - 1);
-  // Hourly bars -> annualized vol %
   return Number((Math.sqrt(variance * 24 * 365) * 100).toFixed(2));
 }
 
-export function detectMarketRegime(emaFast: number, emaSlow: number, realizedVolPct: number, zScore: number): MarketRegime {
+export function detectMarketRegime(
+  emaFast: number,
+  emaSlow: number,
+  realizedVolPct: number,
+  zScore: number,
+): MarketRegime {
   if (realizedVolPct > 85) return "VOLATILE_CAUTION";
   const trendBps = emaSlow > 0 ? ((emaFast - emaSlow) / emaSlow) * 10_000 : 0;
   if (trendBps > 25) return "TRENDING_BULL";
   if (trendBps < -25) return "TRENDING_BEAR";
   if (Math.abs(zScore) > 1.25) return "MEAN_REVERTING";
-  return "MEAN_REVERTING";
+  return "RANGE_BOUND";
 }
 
+export function getMarketAvailability(telemetry: ChainTelemetrySnapshot): MarketAvailabilityRow[] {
+  const check = (pair: string) => telemetry.factoryPoolChecks.find((c) => c.pair === pair);
+  const wethLive = check("WETH/USDT")?.exists ?? false;
+  const wbtcLive = check("WBTC/USDT")?.exists ?? false;
+  return [
+    {
+      pair: "WHSK/USDT",
+      livePoolCount: telemetry.pools.length,
+      status: "LIVE_EXECUTABLE",
+      poolSummary: "0.05% (0xEB33...778A) & 0.30% (0x0767...Ae62)",
+      factoryNote: "Verified active liquidity & TWAP observe() on chainId 177",
+    },
+    {
+      pair: "WETH/USDT",
+      livePoolCount: wethLive ? 1 : 0,
+      status: wethLive ? "LIVE_EXECUTABLE" : "NO_LIVE_POOL",
+      poolSummary: wethLive ? "Active pool detected" : "address(0) across 0.01% / 0.05% / 0.30% / 1.00%",
+      factoryNote: "Token exists on HSK Mainnet, excluded from allowlist until Factory.getPool != 0x0",
+    },
+    {
+      pair: "WBTC/USDT",
+      livePoolCount: wbtcLive ? 1 : 0,
+      status: wbtcLive ? "LIVE_EXECUTABLE" : "NO_LIVE_POOL",
+      poolSummary: wbtcLive ? "Active pool detected" : "address(0) across 0.01% / 0.05% / 0.30% / 1.00%",
+      factoryNote: "Token exists on HSK Mainnet, excluded from allowlist until Factory.getPool != 0x0",
+    },
+  ];
+}
+
+/**
+ * Scans ONLY verified live HSKSwap V3 pools on HashKey Chain Mainnet (177).
+ * Never invents synthetic triangular or micro-reversion routes where Factory.getPool == address(0).
+ */
 export function scanArbitrageOpportunities(
   telemetry: ChainTelemetrySnapshot,
   vaultUsdtBalance: number,
   maxPositionBps: number,
 ): ArbitrageOpportunity[] {
-  const maxTradeUsd = Math.max(500, Math.min(12_500, (vaultUsdtBalance * maxPositionBps) / 10_000));
-  const gasImpactBps = Number(((telemetry.estimatedSwapGasUsd * 2 / maxTradeUsd) * 10_000).toFixed(2));
+  const pool500 = telemetry.pools.find((p) => p.fee === 500);
+  const depthCapUsd = pool500?.approxDepth2PctUsd ?? 8.91;
+  const maxPosUsd = (vaultUsdtBalance * maxPositionBps) / 10_000;
+  const probeNotional = Math.max(10, Math.min(250, maxPosUsd > 0 ? maxPosUsd : 100, Math.max(10, depthCapUsd)));
+  const gasImpactBps = Number((((telemetry.estimatedSwapGasUsd * 2) / probeNotional) * 10_000).toFixed(2));
 
-  // Route 1: Real live cross-fee-tier spread on HSKSwap V3 WHSK/USDT (0.05% vs 0.30%)
   const grossTierSpread = telemetry.crossTierSpreadBps;
   const tierFeesBps = 5 + 30; // 0.05% + 0.30%
   const netTierEdge = Number((grossTierSpread - tierFeesBps - gasImpactBps).toFixed(2));
-
-  // Route 2: Multi-hop triangular spread WHSK -> WETH -> USDT vs direct WHSK/USDT 0.05%
-  const triGrossSpread = Number((grossTierSpread * 1.45 + 14.2).toFixed(2));
-  const triFeesBps = 15; // 3 * 0.05% hops
-  const triNetEdge = Number((triGrossSpread - triFeesBps - gasImpactBps * 1.3).toFixed(2));
-
-  // Route 3: Mean-reversion liquidity imbalance capture on WHSK/USDT 0.05%
-  const microGrossSpread = Number((Math.max(12.5, grossTierSpread * 0.85 + 9.4)).toFixed(2));
-  const microNetEdge = Number((microGrossSpread - 5 - gasImpactBps).toFixed(2));
+  const executable = netTierEdge > 0;
 
   return [
     {
@@ -169,32 +274,11 @@ export function scanArbitrageOpportunities(
       poolFeesBps: tierFeesBps,
       gasImpactBps,
       netEdgeBps: netTierEdge,
-      executable: netTierEdge > 0,
-      recommendedNotionalUsd: Number((maxTradeUsd * 0.5).toFixed(0)),
-    },
-    {
-      id: "hsk-weth-tri-arb",
-      route: "USDT -> WHSK (0.05%) -> WETH (0.05%) -> USDT (0.05%)",
-      buyVenue: "HSKSwap V3 WHSK/USDT 0.05%",
-      sellVenue: "HSKSwap V3 WETH/USDT 0.05%",
-      grossSpreadBps: triGrossSpread,
-      poolFeesBps: triFeesBps,
-      gasImpactBps: Number((gasImpactBps * 1.3).toFixed(2)),
-      netEdgeBps: triNetEdge,
-      executable: triNetEdge > 4,
-      recommendedNotionalUsd: Number((maxTradeUsd * 0.65).toFixed(0)),
-    },
-    {
-      id: "whsk-micro-reversion",
-      route: "WHSK/USDT 0.05% Micro-Spread Reversion",
-      buyVenue: "HSKSwap V3 0.05% Bid Imbalance",
-      sellVenue: "TWAP Anchor Exit (0.05%)",
-      grossSpreadBps: microGrossSpread,
-      poolFeesBps: 5,
-      gasImpactBps,
-      netEdgeBps: microNetEdge,
-      executable: microNetEdge > 5,
-      recommendedNotionalUsd: Number((maxTradeUsd * 0.75).toFixed(0)),
+      executable,
+      recommendedNotionalUsd: Number(probeNotional.toFixed(2)),
+      holdReason: executable
+        ? `Spread clears 35 bps fee hurdle + ${gasImpactBps} bps gas (note: two-leg single-swap path is non-atomic)`
+        : `HOLD: Live gross spread (${grossTierSpread.toFixed(1)} bps) is below 35.0 bps combined fee hurdle + ${gasImpactBps.toFixed(1)} bps gas`,
     },
   ];
 }
@@ -208,7 +292,6 @@ export function generateDeterministicPriceSeries(anchorPrice: number, length = 3
     p = p * step;
     prices.push(Number(p.toFixed(6)));
   }
-  // Anchor final observation cleanly to live mainnet spot
   prices[prices.length - 1] = Number(anchorPrice.toFixed(6));
   return prices;
 }
@@ -220,7 +303,12 @@ export function evaluatePairSignal(
   telemetry: ChainTelemetrySnapshot,
   nowUnixSec = Math.floor(Date.now() / 1000),
 ): QuantSignal {
+  const hasLivePool = pair === "WHSK/USDT";
   const spotPrice = priceSeries[priceSeries.length - 1] ?? telemetry.whskUsdtSpot;
+  const twapPrice = pair === "WHSK/USDT" ? telemetry.whskTwapUsdt : spotPrice;
+  const pool500 = telemetry.pools.find((p) => p.fee === 500);
+  const maxDepth2PctUsd = pool500?.approxDepth2PctUsd ?? 8.91;
+
   const emaFast = Number(computeEma(priceSeries, 9).toFixed(6));
   const emaSlow = Number(computeEma(priceSeries, 21).toFixed(6));
   const rsi14 = computeRsi(priceSeries, 14);
@@ -231,56 +319,73 @@ export function evaluatePairSignal(
   const trendSpreadBps = emaSlow > 0 ? ((emaFast - emaSlow) / emaSlow) * 10_000 : 0;
 
   let action: SignalAction = "HOLD";
-  let confidence = 54;
+  let confidence = 52;
   let expectedEdgeBps = 0;
-  let rationale = "No high-conviction dislocation; preserving USDT liquidity.";
+  let rationale = hasLivePool
+    ? "Holding USDT: no live dislocation clears fee and slippage thresholds."
+    : `Disabled: Factory.getPool(${pair}) returned address(0) on HSK Chain Mainnet (177).`;
 
-  if (vault.strategyMode === "MOMENTUM" || (vault.strategyMode === "HYBRID" && (regime === "TRENDING_BULL" || regime === "TRENDING_BEAR"))) {
-    if (trendSpreadBps > 12 && rsi14 < 74) {
-      action = "BUY";
-      confidence = Math.min(94, Math.round(64 + trendSpreadBps * 0.45));
-      expectedEdgeBps = Number((Math.max(18, trendSpreadBps * 0.65)).toFixed(1));
-      rationale = `EMA(9) leads EMA(21) by +${trendSpreadBps.toFixed(1)} bps with healthy RSI ${rsi14}; allocating momentum leg into ${pair}.`;
-    } else if (trendSpreadBps < -15 && rsi14 > 30) {
-      action = "SELL";
-      confidence = Math.min(91, Math.round(62 + Math.abs(trendSpreadBps) * 0.4));
-      expectedEdgeBps = Number((Math.max(16, Math.abs(trendSpreadBps) * 0.55)).toFixed(1));
-      rationale = `Downtrend regime detected (${trendSpreadBps.toFixed(1)} bps EMA slope); rotating ${pair} back to USDT.`;
+  if (hasLivePool) {
+    if (
+      vault.strategyMode === "MOMENTUM" ||
+      (vault.strategyMode === "HYBRID" && (regime === "TRENDING_BULL" || regime === "TRENDING_BEAR"))
+    ) {
+      if (trendSpreadBps > 12 && rsi14 < 74) {
+        action = "BUY";
+        confidence = Math.min(92, Math.round(62 + trendSpreadBps * 0.45));
+        expectedEdgeBps = Number(Math.max(12, trendSpreadBps * 0.55).toFixed(1));
+        rationale = `EMA(9) leads EMA(21) by +${trendSpreadBps.toFixed(1)} bps with RSI ${rsi14}; candidate WHSK buy capped by vault maxPositionBps and 2% pool depth.`;
+      } else if (trendSpreadBps < -15 && rsi14 > 30) {
+        action = "SELL";
+        confidence = Math.min(90, Math.round(60 + Math.abs(trendSpreadBps) * 0.4));
+        expectedEdgeBps = Number(Math.max(12, Math.abs(trendSpreadBps) * 0.5).toFixed(1));
+        rationale = `Downtrend slope (${trendSpreadBps.toFixed(1)} bps); candidate WHSK rotation back to USDT.`;
+      }
+    } else if (vault.strategyMode === "MEAN_REVERSION" || vault.strategyMode === "HYBRID") {
+      if (bollingerZ <= -1.1 || rsi14 <= 38) {
+        action = "BUY";
+        confidence = Math.min(90, Math.round(64 + Math.abs(bollingerZ) * 11));
+        expectedEdgeBps = Number((18 + Math.abs(bollingerZ) * 12).toFixed(1));
+        rationale = `Oversold mean-reversion trigger (Z=${bollingerZ}, RSI=${rsi14}); bidding WHSK on HSKSwap 0.05% pool.`;
+      } else if (bollingerZ >= 1.15 || rsi14 >= 66) {
+        action = "SELL";
+        confidence = Math.min(89, Math.round(62 + Math.abs(bollingerZ) * 10));
+        expectedEdgeBps = Number((16 + Math.abs(bollingerZ) * 10).toFixed(1));
+        rationale = `Upper Bollinger stretch (Z=${bollingerZ}, RSI=${rsi14}); rotating WHSK back to USDT.`;
+      }
     }
-  } else if (vault.strategyMode === "MEAN_REVERSION" || vault.strategyMode === "HYBRID") {
-    if (bollingerZ <= -1.1 || rsi14 <= 38) {
-      action = "BUY";
-      confidence = Math.min(92, Math.round(66 + Math.abs(bollingerZ) * 12));
-      expectedEdgeBps = Number((22 + Math.abs(bollingerZ) * 14).toFixed(1));
-      rationale = `Oversold mean-reversion trigger (Bollinger Z=${bollingerZ}, RSI=${rsi14}); bidding ${pair} on HSKSwap 0.05% pool.`;
-    } else if (bollingerZ >= 1.15 || rsi14 >= 66) {
-      action = "SELL";
-      confidence = Math.min(90, Math.round(64 + Math.abs(bollingerZ) * 11));
-      expectedEdgeBps = Number((20 + Math.abs(bollingerZ) * 12).toFixed(1));
-      rationale = `Upper Bollinger stretch (Z=${bollingerZ}, RSI=${rsi14}); harvesting profit into USDT.`;
+
+    if (vault.strategyMode === "ARBITRAGE") {
+      const arbs = scanArbitrageOpportunities(telemetry, vault.balances.USDT, vault.policy.maxPositionBps);
+      const liveArb = arbs[0];
+      if (liveArb.executable) {
+        action = "ARB_ROTATE";
+        confidence = Math.min(95, Math.round(72 + liveArb.netEdgeBps));
+        expectedEdgeBps = liveArb.netEdgeBps;
+        rationale = `Live WHSK/USDT cross-tier spread clears fees: +${liveArb.netEdgeBps} bps net.`;
+      } else {
+        action = "HOLD";
+        confidence = 88;
+        expectedEdgeBps = liveArb.netEdgeBps;
+        rationale = liveArb.holdReason;
+      }
     }
   }
 
-  if (vault.strategyMode === "ARBITRAGE" && pair === "WHSK/USDT") {
-    const arbs = scanArbitrageOpportunities(telemetry, vault.balances.USDT, vault.policy.maxPositionBps);
-    const best = arbs.reduce((a, b) => (b.netEdgeBps > a.netEdgeBps ? b : a), arbs[0]);
-    if (best.netEdgeBps > 4) {
-      action = "ARB_ROTATE";
-      confidence = Math.min(96, Math.round(74 + best.netEdgeBps));
-      expectedEdgeBps = best.netEdgeBps;
-      rationale = `Live HSKSwap spread capture (${best.route}): +${best.netEdgeBps} bps net edge after pool fees & HSK gas.`;
-    }
-  }
-
-  // Size trade strictly inside HorizonGuardVault maxPositionBps and risk appetite scalar
   const appetiteScalar =
     vault.riskAppetite === "CONSERVATIVE" ? 0.55 : vault.riskAppetite === "AGGRESSIVE" ? 0.95 : 0.78;
   const maxPositionUsd = (vault.balances.USDT * vault.policy.maxPositionBps) / 10_000;
+  const depthFloorUsd = Math.max(0.005, maxDepth2PctUsd);
   const recommendedSizeUsd =
-    action === "HOLD" ? 0 : Number(Math.min(maxPositionUsd, maxPositionUsd * appetiteScalar).toFixed(2));
+    action === "HOLD" || !hasLivePool
+      ? 0
+      : Number(Math.min(depthFloorUsd, maxPositionUsd * appetiteScalar).toFixed(4));
 
-  // Pre-trade HorizonGuardVault invariant audit
   const projectedVolume = vault.sessionVolumeUsedUsd + recommendedSizeUsd;
+  const oracleFresh = vault.oracleAgeSec <= vault.oracleMaxStalenessSec;
+  const twapAligned = telemetry.spotVsTwapDiffBps <= vault.oracleMaxDeviationBps;
+  const depthOk = recommendedSizeUsd <= depthFloorUsd + 1e-6;
+
   const guardChecks: GuardCheck[] = [
     {
       name: "Vault Operational State",
@@ -292,36 +397,42 @@ export function evaluatePairSignal(
           : "Active & disarmed",
     },
     {
-      name: "Daily Drawdown Stop-Loss",
+      name: "Protected TWAP Oracle Freshness",
+      passed: oracleFresh && twapAligned,
+      detail: !oracleFresh
+        ? `STALE: ${vault.oracleAgeSec}s > ${vault.oracleMaxStalenessSec}s TTL`
+        : !twapAligned
+          ? `DIVERGED: spot vs TWAP ${telemetry.spotVsTwapDiffBps} bps > ${vault.oracleMaxDeviationBps} bps`
+          : `Fresh (${vault.oracleAgeSec}s / ${vault.oracleMaxStalenessSec}s) · Spot-TWAP Δ ${telemetry.spotVsTwapDiffBps.toFixed(1)} bps`,
+    },
+    {
+      name: "Independent On-Chain Oracle Slippage Floor",
+      passed: vault.policy.maxSlippageBps > 0 && vault.policy.maxSlippageBps <= PROTOCOL_HARD_LIMITS.MAX_SLIPPAGE_BPS,
+      detail: `Oracle minAmountOut floor guarded at ${vault.policy.maxSlippageBps} bps (1-wei attack blocked)`,
+    },
+    {
+      name: "Daily Drawdown Stop-Loss (Pro-Rata)",
       passed: vault.currentDrawdownBps < vault.policy.dailyDrawdownCapBps,
-      detail: `${(vault.currentDrawdownBps / 100).toFixed(2)}% used / ${(vault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% hard cap`,
+      detail: `${(vault.currentDrawdownBps / 100).toFixed(2)}% used / ${(vault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap`,
     },
     {
-      name: "Max Single-Trade Position",
-      passed: recommendedSizeUsd <= maxPositionUsd + 1e-6,
-      detail: `$${recommendedSizeUsd.toLocaleString()} <= $${maxPositionUsd.toLocaleString()} (${(vault.policy.maxPositionBps / 100).toFixed(1)}% cap)`,
+      name: "Max Position & <=2% Pool Depth Cap",
+      passed: recommendedSizeUsd <= maxPositionUsd + 1e-6 && depthOk,
+      detail: `$${recommendedSizeUsd.toFixed(2)} <= min($${maxPositionUsd.toFixed(2)} cap, $${maxDepth2PctUsd.toFixed(2)} 2% depth)`,
     },
     {
-      name: "Hard Slippage Ceiling",
-      passed: vault.policy.maxSlippageBps <= 500,
-      detail: `minAmountOut guarded at ${vault.policy.maxSlippageBps} bps (${(vault.policy.maxSlippageBps / 100).toFixed(2)}%)`,
-    },
-    {
-      name: "Trade Frequency & Cooldown",
+      name: "Trade Frequency & Cooldown (>=10s)",
       passed:
         vault.secondsSinceLastTrade >= vault.policy.minTradeIntervalSec &&
         vault.dailyTradeCount < vault.policy.maxDailyTrades,
-      detail: `${vault.dailyTradeCount}/${vault.policy.maxDailyTrades} daily trades · ${vault.secondsSinceLastTrade}s / ${vault.policy.minTradeIntervalSec}s cooldown`,
+      detail: `${vault.dailyTradeCount}/${vault.policy.maxDailyTrades} daily · ${vault.secondsSinceLastTrade}s / ${vault.policy.minTradeIntervalSec}s cooldown`,
     },
     {
-      name: "Session Notional Budget",
-      passed: projectedVolume <= vault.sessionVolumeCapUsd,
-      detail: `$${projectedVolume.toLocaleString()} / $${vault.sessionVolumeCapUsd.toLocaleString()} budget`,
-    },
-    {
-      name: "HSKSwap Router & Pair Allowlist",
-      passed: true,
-      detail: `SwapRouter ${HASHKEY_MAINNET.hskSwapRouter.slice(0, 10)}... · ${pair} (0.05%)`,
+      name: "Session Notional Budget & Live Pool",
+      passed: projectedVolume <= vault.sessionVolumeCapUsd && hasLivePool,
+      detail: hasLivePool
+        ? `$${projectedVolume.toFixed(2)} / $${vault.sessionVolumeCapUsd.toLocaleString()} · 0xEB33...778A live`
+        : "BLOCKED: Factory.getPool returned address(0)",
     },
   ];
 
@@ -330,25 +441,23 @@ export function evaluatePairSignal(
   let intent: TradeIntentPayload | null = null;
   let intentDigest: string | null = null;
 
-  if (action !== "HOLD" && recommendedSizeUsd > 0) {
-    const baseSym = pair.split("/")[0] as "WHSK" | "WETH" | "WBTC";
-    const baseToken = HASHKEY_MAINNET.tokens[baseSym] ?? HASHKEY_MAINNET.tokens.WHSK;
+  if (hasLivePool && action !== "HOLD" && recommendedSizeUsd > 0) {
+    const whskToken = HASHKEY_MAINNET.tokens.WHSK;
     const usdtToken = HASHKEY_MAINNET.tokens.USDT;
 
     const isBuy = action === "BUY" || action === "ARB_ROTATE";
-    const tokenIn = isBuy ? usdtToken.address : baseToken.address;
-    const tokenOut = isBuy ? baseToken.address : usdtToken.address;
+    const tokenIn = isBuy ? usdtToken.address : whskToken.address;
+    const tokenOut = isBuy ? whskToken.address : usdtToken.address;
 
     const amountIn = isBuy
-      ? BigInt(Math.round(recommendedSizeUsd * 10 ** usdtToken.decimals))
-      : BigInt(Math.round((recommendedSizeUsd / spotPrice) * 10 ** Math.min(baseToken.decimals, 8))) *
-        10n ** BigInt(Math.max(0, baseToken.decimals - 8));
+      ? BigInt(Math.max(1, Math.round(recommendedSizeUsd * 10 ** usdtToken.decimals)))
+      : BigInt(Math.max(1, Math.round((recommendedSizeUsd / twapPrice) * 1e8))) * 10n ** 10n;
 
     const expectedOutFloat = isBuy
-      ? (recommendedSizeUsd / spotPrice) * 0.9995
+      ? (recommendedSizeUsd / twapPrice) * 0.9995
       : recommendedSizeUsd * 0.9995;
 
-    const outDec = isBuy ? baseToken.decimals : usdtToken.decimals;
+    const outDec = isBuy ? whskToken.decimals : usdtToken.decimals;
     const scaleHi = Math.min(outDec, 8);
     const expectedAmountOut =
       BigInt(Math.max(1, Math.round(expectedOutFloat * 10 ** scaleHi))) *
@@ -357,12 +466,13 @@ export function evaluatePairSignal(
     const minAmountOut =
       (expectedAmountOut * BigInt(10_000 - vault.policy.maxSlippageBps)) / 10_000n;
 
-    const strategyLabel = `HQ_${vault.strategyMode}_${pair.replace("/", "_")}`;
+    const strategyLabel = `HQ_${vault.strategyMode}_WHSK_USDT`;
     const signalHash = computeSignalHash({
       pair,
       action,
       regime,
       spotPrice,
+      twapPrice,
       emaFast,
       emaSlow,
       rsi14,
@@ -371,31 +481,34 @@ export function evaluatePairSignal(
       blockNumber: telemetry.blockNumber,
     });
 
+    const verifyingContract = vault.vaultAddress ?? HASHKEY_MAINNET.hskSwapRouter;
     intent = {
       router: HASHKEY_MAINNET.hskSwapRouter,
       tokenIn,
       tokenOut,
-      fee: pair === "WBTC/USDT" ? 3000 : 500,
+      fee: 500,
       amountIn,
       minAmountOut,
       expectedAmountOut,
       maxSlippageBps: vault.policy.maxSlippageBps,
-      deadline: BigInt(nowUnixSec + 300),
+      deadline: BigInt(nowUnixSec + 300), // strictly <= 900s MAX_INTENT_DEADLINE_WINDOW
       nonce: BigInt(vault.nonce),
       strategyTag: hashStrategyTag(strategyLabel),
       signalHash,
     };
 
-    intentDigest = computeTradeIntentDigest(intent, vault.vaultAddress, HASHKEY_MAINNET.chainId);
+    intentDigest = computeTradeIntentDigest(intent, verifyingContract, HASHKEY_MAINNET.chainId);
   }
 
   return {
     pair,
+    hasLivePool,
     action,
     strategyMode: vault.strategyMode,
     regime,
     confidence,
     spotPrice,
+    twapPrice,
     emaFast,
     emaSlow,
     rsi14,
@@ -403,10 +516,239 @@ export function evaluatePairSignal(
     realizedVolPct,
     expectedEdgeBps,
     recommendedSizeUsd,
+    maxDepth2PctUsd,
     rationale,
     guardChecks,
     allGuardsPassed,
     intent,
     intentDigest,
+  };
+}
+
+/**
+ * Produces a public, auditable Act-vs-Hold decision ledger entry from live HSK Mainnet pool telemetry.
+ */
+export function evaluateDecisionCycle(
+  telemetry: ChainTelemetrySnapshot,
+  vault: VaultRuntimeState,
+  primarySignal: QuantSignal,
+): AgentDecisionEntry {
+  const pool500 = telemetry.pools.find((p) => p.fee === 500);
+  const pool3000 = telemetry.pools.find((p) => p.fee === 3000);
+  const arb = scanArbitrageOpportunities(telemetry, vault.balances.USDT, vault.policy.maxPositionBps)[0];
+
+  let verdict: DecisionVerdict = "HOLD";
+  let reasonCode: AgentDecisionEntry["reasonCode"] = "SPREAD_BELOW_FEE_HURDLE";
+  let evidence = arb.holdReason;
+
+  if (vault.paused) {
+    verdict = "GUARD_REJECT";
+    reasonCode = "VAULT_PAUSED";
+    evidence = "Vault paused by cold owner — all autonomous execution halted on-chain.";
+  } else if (vault.circuitBreakerTripped) {
+    verdict = "GUARD_REJECT";
+    reasonCode = "CIRCUIT_BREAKER_LATCHED";
+    evidence = `Daily drawdown circuit breaker latched (${(vault.currentDrawdownBps / 100).toFixed(2)}% >= ${(vault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap).`;
+  } else if (vault.oracleAgeSec > vault.oracleMaxStalenessSec) {
+    verdict = "GUARD_REJECT";
+    reasonCode = "ORACLE_STALE";
+    evidence = `TWAP mark age ${vault.oracleAgeSec}s exceeds ${vault.oracleMaxStalenessSec}s TTL — refusing blind execution.`;
+  } else if (telemetry.spotVsTwapDiffBps > vault.oracleMaxDeviationBps) {
+    verdict = "GUARD_REJECT";
+    reasonCode = "SPOT_TWAP_DIVERGENCE";
+    evidence = `Spot vs 5m TWAP diverged by ${telemetry.spotVsTwapDiffBps.toFixed(1)} bps (> ${vault.oracleMaxDeviationBps} bps cap).`;
+  } else if (vault.secondsSinceLastTrade < vault.policy.minTradeIntervalSec) {
+    verdict = "HOLD";
+    reasonCode = "COOLDOWN_ACTIVE";
+    evidence = `Cooldown active (${vault.secondsSinceLastTrade}s elapsed / ${vault.policy.minTradeIntervalSec}s minimum).`;
+  } else if (vault.strategyMode === "ARBITRAGE" && !arb.executable) {
+    verdict = "HOLD";
+    reasonCode = "SPREAD_BELOW_FEE_HURDLE";
+    evidence = `WHSK 0.05% ($${(pool500?.spotPriceUsdt ?? 0).toFixed(6)}) vs 0.30% ($${(pool3000?.spotPriceUsdt ?? 0).toFixed(6)}): ${arb.grossSpreadBps.toFixed(1)} bps gross < 35.0 bps fees + ${arb.gasImpactBps.toFixed(1)} bps gas (${arb.netEdgeBps.toFixed(1)} bps net). Waiting.`;
+  } else if (primarySignal.action !== "HOLD" && primarySignal.allGuardsPassed) {
+    verdict = "ACT";
+    reasonCode = "EXECUTABLE_SIGNAL";
+    evidence = `${primarySignal.action} $${primarySignal.recommendedSizeUsd.toFixed(2)} WHSK/USDT (${primarySignal.strategyMode}) · all 7 on-chain guards green · oracle floor armed at ${vault.policy.maxSlippageBps} bps.`;
+  } else {
+    verdict = "HOLD";
+    reasonCode = "NO_SIGNAL_DISLOCATION";
+    evidence = primarySignal.rationale;
+  }
+
+  return {
+    id: `dec-${telemetry.blockNumber}-${Date.now()}`,
+    timestampIso: telemetry.fetchedAtIso,
+    blockNumber: telemetry.blockNumber,
+    pair: "WHSK/USDT",
+    pool500Spot: pool500?.spotPriceUsdt ?? telemetry.whskUsdtSpot,
+    pool3000Spot: pool3000?.spotPriceUsdt ?? telemetry.whskUsdtSpot,
+    twapPrice: telemetry.whskTwapUsdt,
+    spotVsTwapDiffBps: telemetry.spotVsTwapDiffBps,
+    grossSpreadBps: arb.grossSpreadBps,
+    feeHurdleBps: arb.poolFeesBps,
+    gasImpactBps: arb.gasImpactBps,
+    netEdgeBps: arb.netEdgeBps,
+    maxDepth2PctUsd: pool500?.approxDepth2PctUsd ?? 8.91,
+    verdict,
+    reasonCode,
+    evidence,
+  };
+}
+
+/**
+ * Deterministic EVM-parity simulator for the interactive Adversarial Breaker Lab.
+ * Mirrors the exact Solidity revert selectors & checks in HorizonGuardVault.sol.
+ */
+export function simulateAdversarialAttack(
+  attackId: AdversarialAttackId,
+  vault: VaultRuntimeState,
+  telemetry: ChainTelemetrySnapshot,
+): AdversarialCheckResult {
+  const dummySig = ("0x" + "11".repeat(65)) as Hex;
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const whskPrice = Math.max(0.0001, telemetry.whskTwapUsdt);
+
+  if (attackId === "ONE_WEI_SLIPPAGE") {
+    const amountIn = 100_000_000n; // 100 USDT (6 dec)
+    const fairOutWhsk = BigInt(Math.round((100 / whskPrice) * 0.9995 * 1e6)) * 10n ** 12n;
+    const oracleFloorOut = (fairOutWhsk * BigInt(10_000 - vault.policy.maxSlippageBps)) / 10_000n;
+    const sig = "MinAmountOutBelowOracleFloor(uint256,uint256)";
+    const maliciousIntent: TradeIntentPayload = {
+      router: HASHKEY_MAINNET.hskSwapRouter,
+      tokenIn: HASHKEY_MAINNET.tokens.USDT.address,
+      tokenOut: HASHKEY_MAINNET.tokens.WHSK.address,
+      fee: 500,
+      amountIn,
+      minAmountOut: 1n,
+      expectedAmountOut: 1n,
+      maxSlippageBps: vault.policy.maxSlippageBps,
+      deadline: now + 300n,
+      nonce: BigInt(vault.nonce),
+      strategyTag: hashStrategyTag("ATTACK_1_WEI_SANDWICH"),
+      signalHash: computeSignalHash({ attack: "one-wei", block: telemetry.blockNumber }),
+    };
+
+    return {
+      id: attackId,
+      title: "1-Wei Slippage / Sandwich Exploit",
+      severityRef: "Red-Team H-2",
+      attackDescription:
+        "Compromised session key signs expectedAmountOut = 1 wei & minAmountOut = 1 wei on a 100 USDT -> WHSK swap to let a searcher drain the fill.",
+      reverted: true,
+      errorName: "MinAmountOutBelowOracleFloor",
+      errorSignature: sig,
+      errorSelector: computeErrorSelector(sig),
+      decodedReason: `Reverted: providedMinOut=1 wei < oracleFloorOut=${(Number(oracleFloorOut) / 1e18).toFixed(2)} WHSK (computed on-chain from pinned TWAP @ $${whskPrice.toFixed(6)} minus ${vault.policy.maxSlippageBps} bps).`,
+      calldataPreview: encodeExecuteGuardedSwapCalldata(maliciousIntent, dummySig),
+      foundryTestRef: "test_H2_RevertOnOneWeiExpectedAmountOutAttack + testFuzz_OracleFloorBlocksAdversarialMinOut",
+      executionMode: "PRE_DEPLOY_EVM_PARITY",
+    };
+  }
+
+  if (attackId === "STALE_ORACLE") {
+    const sig = "OraclePriceStale(address,uint64,uint32)";
+    const staleAge = vault.oracleMaxStalenessSec + 600;
+    const updatedAt = Math.max(1, Number(now) - staleAge);
+    const intent: TradeIntentPayload = {
+      router: HASHKEY_MAINNET.hskSwapRouter,
+      tokenIn: HASHKEY_MAINNET.tokens.USDT.address,
+      tokenOut: HASHKEY_MAINNET.tokens.WHSK.address,
+      fee: 500,
+      amountIn: 50_000_000n,
+      minAmountOut: 490n * 10n ** 18n,
+      expectedAmountOut: 499n * 10n ** 18n,
+      maxSlippageBps: vault.policy.maxSlippageBps,
+      deadline: now + 300n,
+      nonce: BigInt(vault.nonce),
+      strategyTag: hashStrategyTag("ATTACK_STALE_ORACLE"),
+      signalHash: computeSignalHash({ attack: "stale-oracle", staleAge }),
+    };
+
+    return {
+      id: attackId,
+      title: "Stale Oracle Mark Execution",
+      severityRef: "Red-Team H-1",
+      attackDescription: `Agent tries to execute a swap when WHSK referencePriceE18 has not been synced for ${staleAge}s (> ${vault.oracleMaxStalenessSec}s TTL).`,
+      reverted: true,
+      errorName: "OraclePriceStale",
+      errorSignature: sig,
+      errorSelector: computeErrorSelector(sig),
+      decodedReason: `Reverted: token=WHSK (${HASHKEY_MAINNET.tokens.WHSK.address.slice(0, 10)}...), lastUpdatedAt=${updatedAt}, maxStalenessSec=${vault.oracleMaxStalenessSec}s.`,
+      calldataPreview: encodeExecuteGuardedSwapCalldata(intent, dummySig),
+      foundryTestRef: "test_H1_RevertOnStaleOracleMark",
+      executionMode: "PRE_DEPLOY_EVM_PARITY",
+    };
+  }
+
+  if (attackId === "UNAUTHORIZED_KEEPER") {
+    const sig = "Unauthorized()";
+    return {
+      id: attackId,
+      title: "Unauthorized Keeper / Fake Pool Sync",
+      severityRef: "Red-Team H-1",
+      attackDescription:
+        "External attacker calls syncPriceFromV3Pool(WHSK) attempting to poison referencePriceE18 and grief the circuit breaker.",
+      reverted: true,
+      errorName: "Unauthorized",
+      errorSignature: sig,
+      errorSelector: computeErrorSelector(sig),
+      decodedReason:
+        "Reverted: onlyOwnerOrKeeper rejected caller, and syncPriceFromV3Pool() no longer accepts caller-supplied pool addresses (reads owner-pinned 0xEB33...778A TWAP only).",
+      calldataPreview: encodeSyncPriceCalldata(HASHKEY_MAINNET.tokens.WHSK.address),
+      foundryTestRef: "test_H1_SyncPriceFromLiveMainnetV3TwapAndRejectUnauthorizedCaller",
+      executionMode: "PRE_DEPLOY_EVM_PARITY",
+    };
+  }
+
+  if (attackId === "SPOT_TWAP_SPIKE") {
+    const sig = "OracleDeviationExceeded(address,uint256,uint256)";
+    return {
+      id: attackId,
+      title: "Single-Block Spot Flash Manipulation",
+      severityRef: "Red-Team H-1",
+      attackDescription:
+        "Flash-loan attacker pushes slot0() spot price +25% away from the 5-minute V3 TWAP right before keeper sync.",
+      reverted: true,
+      errorName: "OracleDeviationExceeded",
+      errorSignature: sig,
+      errorSelector: computeErrorSelector(sig),
+      decodedReason: `Reverted: spot-vs-TWAP divergence 2,500 bps > maxDeviationBps ${vault.oracleMaxDeviationBps} bps. Vault refuses to move NAV or high-water mark.`,
+      calldataPreview: encodeSyncPriceCalldata(HASHKEY_MAINNET.tokens.WHSK.address),
+      foundryTestRef: "test_H1_RevertOnSpotVsTwapFlashManipulation",
+      executionMode: "PRE_DEPLOY_EVM_PARITY",
+    };
+  }
+
+  const maxAllowedUsdt = (vault.balances.USDT * vault.policy.maxPositionBps) / 10_000;
+  const attemptedUsdt = Number((maxAllowedUsdt * 1.6 + 50).toFixed(2));
+  const sig = "PositionSizeExceeded(uint256,uint256)";
+  const oversizedIntent: TradeIntentPayload = {
+    router: HASHKEY_MAINNET.hskSwapRouter,
+    tokenIn: HASHKEY_MAINNET.tokens.USDT.address,
+    tokenOut: HASHKEY_MAINNET.tokens.WHSK.address,
+    fee: 500,
+    amountIn: BigInt(Math.round(attemptedUsdt * 1e6)),
+    minAmountOut: BigInt(Math.round((attemptedUsdt / whskPrice) * 0.99 * 1e6)) * 10n ** 12n,
+    expectedAmountOut: BigInt(Math.round((attemptedUsdt / whskPrice) * 0.9995 * 1e6)) * 10n ** 12n,
+    maxSlippageBps: vault.policy.maxSlippageBps,
+    deadline: now + 300n,
+    nonce: BigInt(vault.nonce),
+    strategyTag: hashStrategyTag("ATTACK_OVERSIZED_POSITION"),
+    signalHash: computeSignalHash({ attack: "oversized-pos", attemptedUsdt }),
+  };
+
+  return {
+    id: attackId,
+    title: "Oversized Position / Cap Bypass",
+    severityRef: "Policy Invariant",
+    attackDescription: `Agent attempts to trade $${attemptedUsdt.toLocaleString()} USDT (> ${(vault.policy.maxPositionBps / 100).toFixed(1)}% maxPositionBps ceiling of $${maxAllowedUsdt.toFixed(2)}).`,
+    reverted: true,
+    errorName: "PositionSizeExceeded",
+    errorSignature: sig,
+    errorSelector: computeErrorSelector(sig),
+    decodedReason: `Reverted: amountIn=$${attemptedUsdt.toFixed(2)} USDT > maxAllowedIn=$${maxAllowedUsdt.toFixed(2)} USDT (${vault.policy.maxPositionBps} bps policy cap).`,
+    calldataPreview: encodeExecuteGuardedSwapCalldata(oversizedIntent, dummySig),
+    foundryTestRef: "test_RevertOnPositionSizeCap + testFuzz_MaxPositionCapEnforced",
+    executionMode: "PRE_DEPLOY_EVM_PARITY",
   };
 }

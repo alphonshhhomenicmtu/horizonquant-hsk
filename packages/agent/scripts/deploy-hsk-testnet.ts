@@ -84,7 +84,10 @@ async function main(): Promise<void> {
 
   const pk = process.env.DEPLOYER_PRIVATE_KEY as Hex;
   const account = privateKeyToAccount(pk);
-  const agentAddress = (process.env.AGENT_ADDRESS ?? account.address) as Address;
+  const agentAddress = process.env.AGENT_ADDRESS as Address | undefined;
+  if (!agentAddress || agentAddress.toLowerCase() === account.address.toLowerCase()) {
+    throw new Error("AGENT_ADDRESS must be provided and distinct from deployer owner address.");
+  }
 
   const walletClient = createWalletClient({
     account,

@@ -7,21 +7,22 @@ export interface BacktestPoint {
   unguardedNavUsd: number;
   benchmarkNavUsd: number;
   guardedDrawdownPct: number;
-  regime: "MOMENTUM" | "MEAN_REVERSION" | "ARBITRAGE" | "SHOCK_PROTECTED";
+  regime: "MOMENTUM" | "MEAN_REVERSION" | "HOLD_FEE_GUARD" | "SHOCK_PROTECTED";
   circuitBreakerTriggered: boolean;
 }
 
 export interface StrategyAttributionRow {
   strategy: string;
   trades: number;
-  winRatePct: number;
+  blockedEvents: number;
   grossPnlUsd: number;
   feesAndGasUsd: number;
   netPnlUsd: number;
-  contributionPct: number;
+  guardImpactNote: string;
 }
 
 export interface BacktestReport {
+  disclaimer: string;
   profile: "CONSERVATIVE" | "BALANCED" | "AGGRESSIVE";
   horizonDays: number;
   initialNavUsd: number;
@@ -29,63 +30,60 @@ export interface BacktestReport {
   finalUnguardedNavUsd: number;
   netPnlUsd: number;
   netReturnPct: number;
-  sharpeRatio: number;
-  sortinoRatio: number;
   maxDrawdownPct: number;
   unguardedMaxDrawdownPct: number;
   drawdownSavedPct: number;
   slippageSavedUsd: number;
   circuitBreakerActivations: number;
+  blockedAdverseSwaps: number;
   totalTrades: number;
-  winRatePct: number;
-  profitFactor: number;
   totalGasHsk: number;
   totalGasUsd: number;
   equityCurve: BacktestPoint[];
   attribution: StrategyAttributionRow[];
 }
 
-// Deterministic 30-day multi-regime return tape calibrated to HSKSwap volatility & liquidity shocks
-const DAILY_MARKET_TAPE: Array<{
+// Illustrative 30-day synthetic stress scenario tape (NOT a live historical backtest).
+// Models normal WHSK/USDT swings plus 3 liquidity/MEV shocks to compare HorizonGuardVault caps vs an unguarded bot.
+const STRESS_SCENARIO_TAPE: Array<{
   hskRetPct: number;
-  regime: "MOMENTUM" | "MEAN_REVERSION" | "ARBITRAGE" | "SHOCK_PROTECTED";
-  arbEdgeBps: number;
+  regime: "MOMENTUM" | "MEAN_REVERSION" | "HOLD_FEE_GUARD" | "SHOCK_PROTECTED";
   adverseSlippageEventBps: number;
 }> = [
-  { hskRetPct: 1.4, regime: "MOMENTUM", arbEdgeBps: 14, adverseSlippageEventBps: 12 },
-  { hskRetPct: 2.1, regime: "MOMENTUM", arbEdgeBps: 18, adverseSlippageEventBps: 15 },
-  { hskRetPct: -0.9, regime: "MEAN_REVERSION", arbEdgeBps: 21, adverseSlippageEventBps: 18 },
-  { hskRetPct: 1.7, regime: "MOMENTUM", arbEdgeBps: 16, adverseSlippageEventBps: 11 },
-  { hskRetPct: 0.6, regime: "ARBITRAGE", arbEdgeBps: 29, adverseSlippageEventBps: 9 },
-  { hskRetPct: -1.8, regime: "MEAN_REVERSION", arbEdgeBps: 24, adverseSlippageEventBps: 22 },
-  { hskRetPct: 2.4, regime: "MOMENTUM", arbEdgeBps: 19, adverseSlippageEventBps: 14 },
-  { hskRetPct: 1.2, regime: "MOMENTUM", arbEdgeBps: 15, adverseSlippageEventBps: 10 },
-  { hskRetPct: -6.8, regime: "SHOCK_PROTECTED", arbEdgeBps: 8, adverseSlippageEventBps: 145 }, // Flash crash + MEV spike
-  { hskRetPct: -3.2, regime: "SHOCK_PROTECTED", arbEdgeBps: 11, adverseSlippageEventBps: 110 },
-  { hskRetPct: 2.9, regime: "MEAN_REVERSION", arbEdgeBps: 31, adverseSlippageEventBps: 25 },
-  { hskRetPct: 1.8, regime: "MOMENTUM", arbEdgeBps: 18, adverseSlippageEventBps: 12 },
-  { hskRetPct: 0.9, regime: "ARBITRAGE", arbEdgeBps: 27, adverseSlippageEventBps: 10 },
-  { hskRetPct: -1.1, regime: "MEAN_REVERSION", arbEdgeBps: 22, adverseSlippageEventBps: 19 },
-  { hskRetPct: 1.5, regime: "MOMENTUM", arbEdgeBps: 17, adverseSlippageEventBps: 13 },
-  { hskRetPct: 2.2, regime: "MOMENTUM", arbEdgeBps: 20, adverseSlippageEventBps: 16 },
-  { hskRetPct: 0.4, regime: "ARBITRAGE", arbEdgeBps: 32, adverseSlippageEventBps: 11 },
-  { hskRetPct: -1.4, regime: "MEAN_REVERSION", arbEdgeBps: 25, adverseSlippageEventBps: 21 },
-  { hskRetPct: 1.9, regime: "MOMENTUM", arbEdgeBps: 16, adverseSlippageEventBps: 14 },
-  { hskRetPct: -5.4, regime: "SHOCK_PROTECTED", arbEdgeBps: 9, adverseSlippageEventBps: 128 }, // Secondary liquidity shock
-  { hskRetPct: 2.1, regime: "MEAN_REVERSION", arbEdgeBps: 28, adverseSlippageEventBps: 20 },
-  { hskRetPct: 1.6, regime: "MOMENTUM", arbEdgeBps: 19, adverseSlippageEventBps: 12 },
-  { hskRetPct: 0.8, regime: "ARBITRAGE", arbEdgeBps: 26, adverseSlippageEventBps: 9 },
-  { hskRetPct: 1.3, regime: "MOMENTUM", arbEdgeBps: 17, adverseSlippageEventBps: 11 },
-  { hskRetPct: -0.7, regime: "MEAN_REVERSION", arbEdgeBps: 23, adverseSlippageEventBps: 16 },
-  { hskRetPct: 1.8, regime: "MOMENTUM", arbEdgeBps: 18, adverseSlippageEventBps: 14 },
-  { hskRetPct: 0.5, regime: "ARBITRAGE", arbEdgeBps: 30, adverseSlippageEventBps: 10 },
-  { hskRetPct: 1.1, regime: "MOMENTUM", arbEdgeBps: 16, adverseSlippageEventBps: 12 },
-  { hskRetPct: -0.6, regime: "MEAN_REVERSION", arbEdgeBps: 21, adverseSlippageEventBps: 15 },
-  { hskRetPct: 1.4, regime: "MOMENTUM", arbEdgeBps: 19, adverseSlippageEventBps: 11 },
+  { hskRetPct: 0.9, regime: "MOMENTUM", adverseSlippageEventBps: 14 },
+  { hskRetPct: 1.4, regime: "MOMENTUM", adverseSlippageEventBps: 18 },
+  { hskRetPct: -0.8, regime: "MEAN_REVERSION", adverseSlippageEventBps: 21 },
+  { hskRetPct: 0.3, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 12 },
+  { hskRetPct: -1.6, regime: "MEAN_REVERSION", adverseSlippageEventBps: 28 },
+  { hskRetPct: 1.8, regime: "MOMENTUM", adverseSlippageEventBps: 16 },
+  { hskRetPct: 0.4, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 15 },
+  { hskRetPct: -0.5, regime: "MEAN_REVERSION", adverseSlippageEventBps: 22 },
+  { hskRetPct: -7.2, regime: "SHOCK_PROTECTED", adverseSlippageEventBps: 165 },
+  { hskRetPct: -3.4, regime: "SHOCK_PROTECTED", adverseSlippageEventBps: 120 },
+  { hskRetPct: 1.9, regime: "MEAN_REVERSION", adverseSlippageEventBps: 25 },
+  { hskRetPct: 1.1, regime: "MOMENTUM", adverseSlippageEventBps: 14 },
+  { hskRetPct: 0.2, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 11 },
+  { hskRetPct: -1.2, regime: "MEAN_REVERSION", adverseSlippageEventBps: 24 },
+  { hskRetPct: 1.0, regime: "MOMENTUM", adverseSlippageEventBps: 17 },
+  { hskRetPct: 1.5, regime: "MOMENTUM", adverseSlippageEventBps: 19 },
+  { hskRetPct: -0.2, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 13 },
+  { hskRetPct: -1.5, regime: "MEAN_REVERSION", adverseSlippageEventBps: 26 },
+  { hskRetPct: 1.2, regime: "MOMENTUM", adverseSlippageEventBps: 15 },
+  { hskRetPct: -5.8, regime: "SHOCK_PROTECTED", adverseSlippageEventBps: 140 },
+  { hskRetPct: 1.4, regime: "MEAN_REVERSION", adverseSlippageEventBps: 22 },
+  { hskRetPct: 0.8, regime: "MOMENTUM", adverseSlippageEventBps: 14 },
+  { hskRetPct: 0.1, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 10 },
+  { hskRetPct: 0.9, regime: "MOMENTUM", adverseSlippageEventBps: 13 },
+  { hskRetPct: -0.9, regime: "MEAN_REVERSION", adverseSlippageEventBps: 18 },
+  { hskRetPct: 1.1, regime: "MOMENTUM", adverseSlippageEventBps: 16 },
+  { hskRetPct: 0.2, regime: "HOLD_FEE_GUARD", adverseSlippageEventBps: 12 },
+  { hskRetPct: 0.7, regime: "MOMENTUM", adverseSlippageEventBps: 14 },
+  { hskRetPct: -0.6, regime: "MEAN_REVERSION", adverseSlippageEventBps: 17 },
+  { hskRetPct: 0.8, regime: "MOMENTUM", adverseSlippageEventBps: 13 },
 ];
 
-export function runDeterministicBacktest(
-  initialNavUsd = 70_000,
+export function runGuardrailStressScenario(
+  initialNavUsd = 1_000,
   policy: RiskPolicyConfig = {
     maxSlippageBps: 50,
     maxPositionBps: 2500,
@@ -98,7 +96,7 @@ export function runDeterministicBacktest(
 ): BacktestReport {
   const posFraction = Math.min(1, policy.maxPositionBps / 10_000);
   const ddCapFraction = policy.dailyDrawdownCapBps / 10_000;
-  const profileMultiplier = profile === "CONSERVATIVE" ? 0.72 : profile === "AGGRESSIVE" ? 1.28 : 1.0;
+  const profileMultiplier = profile === "CONSERVATIVE" ? 0.65 : profile === "AGGRESSIVE" ? 1.2 : 1.0;
 
   let guardedNav = initialNavUsd;
   let unguardedNav = initialNavUsd;
@@ -111,19 +109,15 @@ export function runDeterministicBacktest(
 
   let slippageSavedUsd = 0;
   let circuitBreakerActivations = 0;
+  let blockedAdverseSwaps = 0;
   let totalTrades = 0;
-  let wins = 0;
-  let grossWinUsd = 0;
-  let grossLossUsd = 0;
   let totalGasHsk = 0;
 
-  const dailyGuardedReturns: number[] = [];
-
   const buckets = {
-    MOMENTUM: { trades: 0, wins: 0, gross: 0, costs: 0 },
-    MEAN_REVERSION: { trades: 0, wins: 0, gross: 0, costs: 0 },
-    ARBITRAGE: { trades: 0, wins: 0, gross: 0, costs: 0 },
-    SHOCK_CB: { trades: 0, wins: 0, gross: 0, costs: 0 },
+    MOMENTUM: { trades: 0, blocked: 0, gross: 0, costs: 0 },
+    MEAN_REVERSION: { trades: 0, blocked: 0, gross: 0, costs: 0 },
+    HOLD_FEE_GUARD: { trades: 0, blocked: 0, gross: 0, costs: 0 },
+    SHOCK_CB: { trades: 0, blocked: 0, gross: 0, costs: 0 },
   };
 
   const equityCurve: BacktestPoint[] = [
@@ -139,80 +133,76 @@ export function runDeterministicBacktest(
     },
   ];
 
-  for (let i = 0; i < DAILY_MARKET_TAPE.length; i++) {
-    const bar = DAILY_MARKET_TAPE[i];
-    const prevGuarded = guardedNav;
+  for (let i = 0; i < STRESS_SCENARIO_TAPE.length; i++) {
+    const bar = STRESS_SCENARIO_TAPE[i];
 
-    // Benchmark buy-and-hold 50% WHSK / 50% USDT
+    // 50% WHSK / 50% USDT passive hold reference
     benchmarkNav = benchmarkNav * (1 + (bar.hskRetPct / 100) * 0.5);
 
-    const notional = guardedNav * posFraction * profileMultiplier;
-    const tradesToday = Math.min(policy.maxDailyTrades, bar.regime === "ARBITRAGE" ? 6 : 4);
+    const notional = Math.min(guardedNav, guardedNav * posFraction * profileMultiplier);
+    const tradesToday = bar.regime === "HOLD_FEE_GUARD" ? 0 : Math.min(policy.maxDailyTrades, 2);
     const gasHskToday = tradesToday * 0.115;
     const gasUsdToday = gasHskToday * whskSpotUsd;
 
-    // Unguarded bot executes blindly through MEV slippage spikes and never halts on drawdown shocks
-    const unguardedShockLoss =
+    // Unguarded bot executes blindly even during spread/MEV shocks without slippage floor or circuit breaker
+    const unguardedNotional = unguardedNav * 0.45;
+    const unguardedDayDelta =
       bar.regime === "SHOCK_PROTECTED"
-        ? unguardedNav * (bar.hskRetPct / 100) * 0.72 - (unguardedNav * 0.4 * bar.adverseSlippageEventBps) / 10_000
-        : unguardedNav * ((Math.abs(bar.hskRetPct) * 0.34) / 100) - (unguardedNav * 0.3 * bar.adverseSlippageEventBps) / 10_000;
-    unguardedNav = Math.max(1000, unguardedNav + unguardedShockLoss - gasUsdToday);
+        ? unguardedNav * (bar.hskRetPct / 100) * 0.65 - (unguardedNotional * bar.adverseSlippageEventBps) / 10_000
+        : bar.regime === "HOLD_FEE_GUARD"
+          ? -(unguardedNotional * 35) / 10_000 // unguarded bot churns unprofitable 35 bps fee spreads
+          : unguardedNotional * ((bar.hskRetPct * 0.35) / 100) -
+            (unguardedNotional * bar.adverseSlippageEventBps) / 10_000;
+    unguardedNav = Math.max(initialNavUsd * 0.1, unguardedNav + unguardedDayDelta - 2 * 0.115 * whskSpotUsd);
 
     let cbTriggered = false;
     let dayGrossPnl = 0;
-    let dayCosts = gasUsdToday + (notional * 5) / 10_000; // 0.05% HSKSwap fee
+    let dayCosts = tradesToday > 0 ? gasUsdToday + (notional * 5) / 10_000 : 0;
 
     if (bar.regime === "SHOCK_PROTECTED") {
-      // On-chain HorizonGuardVault slippage cap rejects adverse MEV fills & daily drawdown cap bounds losses
       if (bar.adverseSlippageEventBps > policy.maxSlippageBps) {
         const saved = (notional * (bar.adverseSlippageEventBps - policy.maxSlippageBps)) / 10_000;
         slippageSavedUsd += saved;
+        blockedAdverseSwaps += 1;
+        buckets.SHOCK_CB.blocked += 1;
       }
-      const rawLoss = -guardedNav * Math.abs(bar.hskRetPct / 100) * posFraction * 1.1;
-      const cappedLoss = -guardedNav * Math.min(ddCapFraction * 0.62, Math.abs(rawLoss / guardedNav));
-      dayGrossPnl = cappedLoss;
-      cbTriggered = Math.abs(rawLoss / guardedNav) >= ddCapFraction * 0.45;
+      // Existing spot WHSK inventory still takes mark-to-market hit up to dailyDrawdownCapBps before breaker latches
+      const rawInventoryLoss = -guardedNav * Math.abs(bar.hskRetPct / 100) * (posFraction * 0.9);
+      const realizedShockLoss = -guardedNav * Math.min(ddCapFraction, Math.abs(rawInventoryLoss / guardedNav));
+      dayGrossPnl = realizedShockLoss;
+      dayCosts = gasUsdToday * 0.5;
+      cbTriggered = Math.abs(rawInventoryLoss / guardedNav) >= ddCapFraction * 0.5;
       if (cbTriggered) circuitBreakerActivations += 1;
       buckets.SHOCK_CB.trades += 1;
       buckets.SHOCK_CB.gross += dayGrossPnl;
-      buckets.SHOCK_CB.costs += dayCosts * 0.4;
+      buckets.SHOCK_CB.costs += dayCosts;
       totalTrades += 1;
+      totalGasHsk += gasHskToday * 0.5;
+    } else if (bar.regime === "HOLD_FEE_GUARD") {
+      // Agent Decision Ledger explicitly HOLDS when spread < 35 bps fee hurdle (zero fee bleed)
+      buckets.HOLD_FEE_GUARD.blocked += 1;
+      dayGrossPnl = 0;
+      dayCosts = 0;
     } else if (bar.regime === "MOMENTUM") {
-      dayGrossPnl = notional * ((bar.hskRetPct * 0.68) / 100) + (notional * bar.arbEdgeBps * 0.15) / 10_000;
+      dayGrossPnl = notional * ((bar.hskRetPct * 0.55) / 100);
       buckets.MOMENTUM.trades += tradesToday;
-      if (dayGrossPnl > dayCosts) buckets.MOMENTUM.wins += Math.max(1, tradesToday - 1);
       buckets.MOMENTUM.gross += dayGrossPnl;
       buckets.MOMENTUM.costs += dayCosts;
       totalTrades += tradesToday;
-    } else if (bar.regime === "MEAN_REVERSION") {
-      const revCapture = Math.abs(bar.hskRetPct) * 0.42;
-      dayGrossPnl = notional * (revCapture / 100) * (bar.hskRetPct < -1.5 ? 0.45 : 1.0);
+      totalGasHsk += gasHskToday;
+    } else {
+      // Mean reversion includes both winning and losing days honestly
+      const capture = bar.hskRetPct < -1.3 ? -Math.abs(bar.hskRetPct) * 0.18 : Math.abs(bar.hskRetPct) * 0.35;
+      dayGrossPnl = notional * (capture / 100);
       buckets.MEAN_REVERSION.trades += tradesToday;
-      if (dayGrossPnl > dayCosts) buckets.MEAN_REVERSION.wins += Math.max(1, tradesToday - 1);
       buckets.MEAN_REVERSION.gross += dayGrossPnl;
       buckets.MEAN_REVERSION.costs += dayCosts;
       totalTrades += tradesToday;
-    } else {
-      dayGrossPnl = (notional * Math.max(6, bar.arbEdgeBps - 5)) / 10_000 * 1.9;
-      buckets.ARBITRAGE.trades += tradesToday;
-      buckets.ARBITRAGE.wins += tradesToday;
-      buckets.ARBITRAGE.gross += dayGrossPnl;
-      buckets.ARBITRAGE.costs += dayCosts;
-      totalTrades += tradesToday;
+      totalGasHsk += gasHskToday;
     }
 
-    const dayNetPnl = dayGrossPnl - (bar.regime === "SHOCK_PROTECTED" ? dayCosts * 0.4 : dayCosts);
-    guardedNav = Math.max(1000, guardedNav + dayNetPnl);
-    totalGasHsk += gasHskToday;
-
-    if (dayNetPnl >= 0) {
-      wins += 1;
-      grossWinUsd += dayNetPnl;
-    } else {
-      grossLossUsd += Math.abs(dayNetPnl);
-    }
-
-    dailyGuardedReturns.push((guardedNav - prevGuarded) / prevGuarded);
+    const dayNetPnl = dayGrossPnl - dayCosts;
+    guardedNav = Math.max(initialNavUsd * 0.1, guardedNav + dayNetPnl);
 
     if (guardedNav > guardedPeak) guardedPeak = guardedNav;
     if (unguardedNav > unguardedPeak) unguardedPeak = unguardedNav;
@@ -234,63 +224,71 @@ export function runDeterministicBacktest(
     });
   }
 
-  const meanRet = dailyGuardedReturns.reduce((a, b) => a + b, 0) / dailyGuardedReturns.length;
-  const variance =
-    dailyGuardedReturns.reduce((a, r) => a + (r - meanRet) ** 2, 0) / Math.max(1, dailyGuardedReturns.length - 1);
-  const stdDev = Math.sqrt(variance);
-  const downsideSumSq = dailyGuardedReturns.reduce((a, r) => a + (r < 0 ? r * r : 0), 0);
-  const downVar =
-    downsideSumSq > 0
-      ? downsideSumSq / dailyGuardedReturns.length
-      : Math.max(1e-8, variance * 0.35);
-  const sharpeRatio = stdDev > 0 ? Number(((meanRet / stdDev) * Math.sqrt(365)).toFixed(2)) : 0;
-  const sortinoRatio = Number(((meanRet / Math.sqrt(downVar)) * Math.sqrt(365)).toFixed(2));
-
   const netPnlUsd = Number((guardedNav - initialNavUsd).toFixed(2));
   const netReturnPct = Number(((netPnlUsd / initialNavUsd) * 100).toFixed(2));
 
-  const rawRows: Array<{ label: string; b: (typeof buckets)["MOMENTUM"] }> = [
-    { label: "Regime Momentum (WHSK/USDT)", b: buckets.MOMENTUM },
-    { label: "Mean-Reversion (RSI/Bollinger)", b: buckets.MEAN_REVERSION },
-    { label: "HSKSwap Cross-Tier Arb", b: buckets.ARBITRAGE },
-    { label: "Flash-Crash Stop-Loss (CB Bounded)", b: buckets.SHOCK_CB },
+  const attribution: StrategyAttributionRow[] = [
+    {
+      strategy: "WHSK/USDT Trend Sleeve (0.05% Pool)",
+      trades: buckets.MOMENTUM.trades,
+      blockedEvents: buckets.MOMENTUM.blocked,
+      grossPnlUsd: Number(buckets.MOMENTUM.gross.toFixed(2)),
+      feesAndGasUsd: Number(buckets.MOMENTUM.costs.toFixed(2)),
+      netPnlUsd: Number((buckets.MOMENTUM.gross - buckets.MOMENTUM.costs).toFixed(2)),
+      guardImpactNote: "Capped by maxPositionBps & 2% active pool depth",
+    },
+    {
+      strategy: "WHSK/USDT Mean-Reversion Sleeve",
+      trades: buckets.MEAN_REVERSION.trades,
+      blockedEvents: buckets.MEAN_REVERSION.blocked,
+      grossPnlUsd: Number(buckets.MEAN_REVERSION.gross.toFixed(2)),
+      feesAndGasUsd: Number(buckets.MEAN_REVERSION.costs.toFixed(2)),
+      netPnlUsd: Number((buckets.MEAN_REVERSION.gross - buckets.MEAN_REVERSION.costs).toFixed(2)),
+      guardImpactNote: "Includes negative whipsaw days when spot overshoots",
+    },
+    {
+      strategy: "Cross-Tier Spread Hold Guard (0.05% vs 0.30%)",
+      trades: buckets.HOLD_FEE_GUARD.trades,
+      blockedEvents: buckets.HOLD_FEE_GUARD.blocked,
+      grossPnlUsd: 0,
+      feesAndGasUsd: 0,
+      netPnlUsd: 0,
+      guardImpactNote: "Explicitly HELD when gross spread < 35 bps fee hurdle (avoided churn)",
+    },
+    {
+      strategy: "Shock Days — Oracle Slippage Floor & Circuit Breaker",
+      trades: buckets.SHOCK_CB.trades,
+      blockedEvents: buckets.SHOCK_CB.blocked,
+      grossPnlUsd: Number(buckets.SHOCK_CB.gross.toFixed(2)),
+      feesAndGasUsd: Number(buckets.SHOCK_CB.costs.toFixed(2)),
+      netPnlUsd: Number((buckets.SHOCK_CB.gross - buckets.SHOCK_CB.costs).toFixed(2)),
+      guardImpactNote: `Blocked ${blockedAdverseSwaps} MEV slippage spikes; tripped CB ${circuitBreakerActivations}x`,
+    },
   ];
-  const totalAttrNet = rawRows.reduce((acc, r) => acc + Math.max(0, r.b.gross - r.b.costs), 0) || 1;
-
-  const attribution: StrategyAttributionRow[] = rawRows.map(({ label, b }) => {
-    const net = Number((b.gross - b.costs).toFixed(2));
-    return {
-      strategy: label,
-      trades: b.trades,
-      winRatePct: b.trades > 0 ? Number(((b.wins / b.trades) * 100).toFixed(1)) : 0,
-      grossPnlUsd: Number(b.gross.toFixed(2)),
-      feesAndGasUsd: Number(b.costs.toFixed(2)),
-      netPnlUsd: net,
-      contributionPct: Number(((Math.max(0, net) / totalAttrNet) * 100).toFixed(1)),
-    };
-  });
 
   return {
+    disclaimer:
+      "Illustrative 30-day synthetic stress scenario modeling HorizonGuardVault drawdown & slippage caps against an unguarded bot — not a historical live trading backtest.",
     profile,
-    horizonDays: DAILY_MARKET_TAPE.length,
+    horizonDays: STRESS_SCENARIO_TAPE.length,
     initialNavUsd,
     finalGuardedNavUsd: Number(guardedNav.toFixed(2)),
     finalUnguardedNavUsd: Number(unguardedNav.toFixed(2)),
     netPnlUsd,
     netReturnPct,
-    sharpeRatio,
-    sortinoRatio,
     maxDrawdownPct: Number(maxGuardedDd.toFixed(2)),
     unguardedMaxDrawdownPct: Number(maxUnguardedDd.toFixed(2)),
     drawdownSavedPct: Number(Math.max(0, maxUnguardedDd - maxGuardedDd).toFixed(2)),
     slippageSavedUsd: Number(slippageSavedUsd.toFixed(2)),
     circuitBreakerActivations,
+    blockedAdverseSwaps,
     totalTrades,
-    winRatePct: Number(((wins / DAILY_MARKET_TAPE.length) * 100).toFixed(1)),
-    profitFactor: grossLossUsd > 0 ? Number((grossWinUsd / grossLossUsd).toFixed(2)) : 9.99,
     totalGasHsk: Number(totalGasHsk.toFixed(3)),
     totalGasUsd: Number((totalGasHsk * whskSpotUsd).toFixed(2)),
     equityCurve,
     attribution,
   };
 }
+
+// Backward-compatible export alias
+export const runDeterministicBacktest = runGuardrailStressScenario;

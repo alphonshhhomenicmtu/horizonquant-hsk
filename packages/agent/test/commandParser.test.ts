@@ -4,17 +4,22 @@ import { VERIFIED_MAINNET_SNAPSHOT } from "../src/rpc/hskTelemetry.js";
 import type { VaultRuntimeState } from "../src/strategy/signalEngine.js";
 
 const baseVault: VaultRuntimeState = {
-  vaultAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  agentAddress: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+  vaultAddress: null,
+  ownerAddress: "0x57A46E4E5F538452E4D672EF9D48e3e90E10A81C",
+  agentAddress: "0x000000000000000000000000000000000000dEaD",
+  isLiveOnChain: false,
   paused: false,
   circuitBreakerTripped: false,
   currentDrawdownBps: 45,
-  dailyTradeCount: 5,
+  dailyTradeCount: 2,
   secondsSinceLastTrade: 360,
-  sessionVolumeUsedUsd: 32_000,
-  sessionVolumeCapUsd: 250_000,
-  nonce: 5,
-  balances: { USDT: 46_250, WHSK: 237_500, WETH: 2.4, WBTC: 0.08 },
+  oracleAgeSec: 45,
+  oracleMaxStalenessSec: 3600,
+  oracleMaxDeviationBps: 1000,
+  sessionVolumeUsedUsd: 120,
+  sessionVolumeCapUsd: 1_000,
+  nonce: 2,
+  balances: { USDT: 500, WHSK: 5_000 },
   policy: {
     maxSlippageBps: 50,
     maxPositionBps: 2500,
@@ -24,11 +29,11 @@ const baseVault: VaultRuntimeState = {
   },
   strategyMode: "HYBRID",
   riskAppetite: "BALANCED",
-  targetPairs: ["WHSK/USDT", "WETH/USDT"],
+  targetPairs: ["WHSK/USDT"],
 };
 
-describe("Conversational Strategy & Risk Command Parser", () => {
-  it("parses flagship natural-language policy directive accurately", () => {
+describe("Deterministic Policy Compiler", () => {
+  it("compiles flagship risk directive into ABI calldata", () => {
     const res = parseAndExecuteCopilotCommand(
       "Cap daily loss at 2.5%, allocate 20% into HSK/USDT momentum with 40bps max slippage",
       baseVault,
@@ -46,20 +51,22 @@ describe("Conversational Strategy & Risk Command Parser", () => {
     expect(res.onChainActions[0].calldata).toMatch(/^0x[a-f0-9]+$/);
   });
 
-  it("rejects slippage above HorizonGuardVault hard protocol ceiling (500 bps)", () => {
+  it("rejects slippage above HARD_MAX_SLIPPAGE_BPS (500 bps) and sub-10s cooldowns", () => {
     const res = parseAndExecuteCopilotCommand(
-      "Set max slippage to 800bps and allocate 30%",
+      "Set max slippage to 800bps, cooldown 3 seconds, allocate 30%",
       baseVault,
       VERIFIED_MAINNET_SNAPSHOT,
     );
 
-    expect(res.rejectedConstraints.length).toBe(1);
+    expect(res.rejectedConstraints.length).toBe(2);
     expect(res.rejectedConstraints[0]).toContain("HARD_MAX_SLIPPAGE_BPS");
-    expect(res.appliedPolicy.maxSlippageBps).toBe(50); // unchanged
-    expect(res.appliedPolicy.maxPositionBps).toBe(3000); // valid portion still applied
+    expect(res.rejectedConstraints[1]).toContain("MIN_TRADE_INTERVAL_SEC");
+    expect(res.appliedPolicy.maxSlippageBps).toBe(50);
+    expect(res.appliedPolicy.minTradeIntervalSec).toBe(300);
+    expect(res.appliedPolicy.maxPositionBps).toBe(3000);
   });
 
-  it("handles trade frequency, conservative preset, and multiple target pairs", () => {
+  it("warns when targeting WETH/USDT or WBTC/USDT where Factory.getPool returns address(0)", () => {
     const res = parseAndExecuteCopilotCommand(
       "Switch to conservative mean-reversion on WHSK/USDT and WETH/USDT, trade every 15 minutes, max 10 trades per day",
       baseVault,
@@ -68,7 +75,9 @@ describe("Conversational Strategy & Risk Command Parser", () => {
 
     expect(res.patch.riskAppetite).toBe("CONSERVATIVE");
     expect(res.patch.strategyMode).toBe("MEAN_REVERSION");
-    expect(res.patch.targetPairs).toEqual(["WHSK/USDT", "WETH/USDT"]);
+    expect(res.patch.targetPairs).toEqual(["WHSK/USDT"]);
+    expect(res.warnings.length).toBeGreaterThanOrEqual(1);
+    expect(res.warnings[0]).toContain("WETH/USDT");
     expect(res.appliedPolicy.minTradeIntervalSec).toBe(900);
     expect(res.appliedPolicy.maxDailyTrades).toBe(10);
   });
@@ -85,14 +94,23 @@ describe("Conversational Strategy & Risk Command Parser", () => {
     expect(res.onChainActions[0].functionName).toBe("setPaused(bool)");
   });
 
-  it("answers live positions, PnL, and arbitrage spread queries", () => {
-    const pos = parseAndExecuteCopilotCommand("Show live positions, NAV, and drawdown buffer", baseVault, VERIFIED_MAINNET_SNAPSHOT);
+  it("answers live positions, NAV, and honest cross-tier spread queries", () => {
+    const pos = parseAndExecuteCopilotCommand(
+      "Show live positions, NAV, and drawdown buffer",
+      baseVault,
+      VERIFIED_MAINNET_SNAPSHOT,
+    );
     expect(pos.intentType).toBe("PORTFOLIO_QUERY");
-    expect(pos.reply).toContain("Total Vault NAV");
+    expect(pos.reply).toContain("Vault NAV");
 
-    const arb = parseAndExecuteCopilotCommand("Scan HSKSwap spread arbitrage opportunities", baseVault, VERIFIED_MAINNET_SNAPSHOT);
+    const arb = parseAndExecuteCopilotCommand(
+      "Scan HSKSwap spread arbitrage opportunities",
+      baseVault,
+      VERIFIED_MAINNET_SNAPSHOT,
+    );
     expect(arb.intentType).toBe("ARB_SCAN");
-    expect(arb.reply).toContain("HSKSwap V3 Spread Radar");
+    expect(arb.reply).toContain("HOLD — BELOW FEE HURDLE");
+    expect(arb.reply).toContain("address(0)");
   });
 
   it("simulates drawdown shock and trips circuit breaker when exceeding policy cap", () => {

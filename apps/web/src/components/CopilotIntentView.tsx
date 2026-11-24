@@ -1,13 +1,14 @@
 import { useState } from "react";
-import { Bot, CheckCircle2, FileCode2, Play, Send, ShieldCheck, XCircle } from "lucide-react";
+import { Bot, CheckCircle2, ExternalLink, FileCode2, Play, Send, ShieldCheck, XCircle } from "lucide-react";
 import {
+  HASHKEY_MAINNET,
   serializeIntentForDisplay,
   type QuantSignal,
   type VaultRuntimeState,
 } from "@horizonquant/agent";
 import type { ChatMessage } from "./CommandOverviewView";
 
-export interface SimulatedExecutionLog {
+export interface ExecutionLogItem {
   id: number;
   timestamp: string;
   pair: string;
@@ -17,36 +18,42 @@ export interface SimulatedExecutionLog {
   strategyTag: string;
   signalHash: string;
   intentDigest: string;
+  mode: "ON_CHAIN_TX" | "PAPER_FILL";
+  txHash?: string;
 }
 
 interface CopilotIntentViewProps {
   vault: VaultRuntimeState;
-  signals: QuantSignal[];
+  primarySignal: QuantSignal;
   messages: ChatMessage[];
-  executions: SimulatedExecutionLog[];
+  executions: ExecutionLogItem[];
+  walletAddress: string | null;
+  busyTx: boolean;
   onSendCommand: (cmd: string) => void;
   onExecuteSignal: (signal: QuantSignal) => void;
 }
 
 const STUDIO_PROMPTS = [
-  "Cap daily loss at 3%, allocate 25% into HSK/USDT momentum with 50bps max slippage",
-  "Set max slippage to 800bps and allocate 30%",
-  "Trade every 15 minutes, max 12 trades per day, target WHSK/USDT and WETH/USDT",
+  "Cap daily loss at 3%, allocate 25% into WHSK/USDT momentum with 50bps max slippage",
+  "Set max slippage to 800bps and cooldown 3 seconds",
+  "Switch to arbitrage mode on WHSK/USDT",
+  "Try targeting WETH/USDT and WBTC/USDT",
   "Simulate 3.5% drawdown crash to test circuit breaker",
-  "Reset circuit breaker and resume trading",
 ];
 
 export function CopilotIntentView({
   vault,
-  signals,
+  primarySignal,
   messages,
   executions,
+  walletAddress,
+  busyTx,
   onSendCommand,
   onExecuteSignal,
 }: CopilotIntentViewProps) {
   const [input, setInput] = useState("");
-  const activeSignal = signals.find((s) => s.intent !== null) ?? signals[0];
-  const serializedIntent = activeSignal?.intent ? serializeIntentForDisplay(activeSignal.intent) : null;
+  const serializedIntent = primarySignal.intent ? serializeIntentForDisplay(primarySignal.intent) : null;
+  const canSendRealTx = Boolean(walletAddress && vault.vaultAddress && vault.isLiveOnChain);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -57,16 +64,16 @@ export function CopilotIntentView({
 
   return (
     <div className="equal-split">
-      {/* Left: Full Conversational Strategy Terminal */}
+      {/* Left: Deterministic Policy Compiler */}
       <div className="card copilot-box">
         <div className="card-header" style={{ marginBottom: 4 }}>
           <div>
             <div className="card-title">
               <Bot size={15} className="text-cyan" />
-              Natural-Language Strategy &amp; Risk Policy Terminal
+              Deterministic Policy Compiler &amp; Calldata Studio
             </div>
             <div className="card-subtitle">
-              Real-time constraint validation against Solidity HARD_MAX_SLIPPAGE_BPS (500 bps) &amp; daily drawdown caps
+              Compiles plain-English risk rules against Solidity HARD_MAX_SLIPPAGE_BPS (500), MIN_TRADE_INTERVAL_SEC (10s) &amp; live pool checks
             </div>
           </div>
           <span className="badge badge-cyan">{vault.strategyMode}</span>
@@ -78,12 +85,14 @@ export function CopilotIntentView({
               <div>{m.text}</div>
               {m.rejected && m.rejected.length > 0 && (
                 <div style={{ marginTop: 6, color: "#fda4af", fontSize: 11.5 }}>
-                  Guard Rejection: {m.rejected.join(" | ")}
+                  Solidity Invariant Rejection: {m.rejected.join(" | ")}
                 </div>
               )}
               {m.fnName && m.calldata && (
                 <div className="code-block" style={{ marginTop: 6 }}>
-                  <div style={{ color: "#94a3b8", marginBottom: 2 }}>Encoded HorizonGuardVault Calldata ({m.fnName}):</div>
+                  <div style={{ color: "#94a3b8", marginBottom: 2 }}>
+                    ABI Calldata ({m.fnName}) — {canSendRealTx ? "ready to broadcast via wallet" : "connect wallet + deployed vault to broadcast"}:
+                  </div>
                   {m.calldata}
                 </div>
               )}
@@ -104,40 +113,40 @@ export function CopilotIntentView({
             className="chat-input"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Type any risk guardrail, strategy mode, asset, or emergency command..."
+            placeholder="Type any risk cap, slippage limit, cooldown, or emergency command..."
           />
           <button className="btn btn-primary" type="submit">
             <Send size={13} />
-            Dispatch
+            Compile
           </button>
         </form>
       </div>
 
-      {/* Right: Live EIP-712 Intent Inspector & Execution Ledger */}
+      {/* Right: Live EIP-712 Intent Inspector & Honest Execution Log */}
       <div className="stack">
         <div className="card">
           <div className="card-header">
             <div>
               <div className="card-title">
                 <FileCode2 size={15} className="text-emerald" />
-                Live EIP-712 TradeIntent Inspector ({activeSignal.pair})
+                EIP-712 TradeIntent Inspector ({primarySignal.pair})
               </div>
               <div className="card-subtitle">
-                Session Key {vault.agentAddress.slice(0, 10)}...{vault.agentAddress.slice(-6)} · Domain chainId=177
+                Session Key {vault.agentAddress.slice(0, 10)}...{vault.agentAddress.slice(-6)} · Deadline ≤ 15m · Chain ID 177
               </div>
             </div>
             <button
               className="btn btn-sm btn-primary"
-              disabled={!activeSignal.intent || !activeSignal.allGuardsPassed}
-              onClick={() => onExecuteSignal(activeSignal)}
+              disabled={busyTx || !primarySignal.intent || !primarySignal.allGuardsPassed}
+              onClick={() => onExecuteSignal(primarySignal)}
             >
               <Play size={11} />
-              Sign &amp; Execute Swap
+              {canSendRealTx ? "Sign & Broadcast Swap" : "Simulate Paper Fill"}
             </button>
           </div>
 
           <div className="guard-list" style={{ marginBottom: 12 }}>
-            {activeSignal.guardChecks.map((check) => (
+            {primarySignal.guardChecks.map((check) => (
               <div key={check.name} className="guard-row">
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   {check.passed ? (
@@ -157,13 +166,14 @@ export function CopilotIntentView({
           {serializedIntent ? (
             <div className="code-block">
               <div style={{ color: "#94a3b8", marginBottom: 4 }}>
-                EIP-712 Digest: <span style={{ color: "#34d399" }}>{activeSignal.intentDigest}</span>
+                EIP-712 Digest ({vault.isLiveOnChain ? "Deployed Vault Domain" : "Pre-Deploy Preview"}):{" "}
+                <span style={{ color: "#34d399" }}>{primarySignal.intentDigest}</span>
               </div>
               {JSON.stringify(serializedIntent, null, 2)}
             </div>
           ) : (
             <div className="code-block" style={{ color: "#94a3b8" }}>
-              Signal is HOLD — awaiting momentum/spread trigger before signing TradeIntent.
+              Signal is HOLD — {primarySignal.rationale}
             </div>
           )}
         </div>
@@ -172,37 +182,61 @@ export function CopilotIntentView({
           <div className="card-header">
             <div className="card-title">
               <ShieldCheck size={15} className="text-cyan" />
-              On-Chain Execution Audit Trail (ExecutionRecord[])
+              {vault.isLiveOnChain ? "On-Chain ExecutionRecord[] Log" : "Local Paper-Fill Session Log"}
             </div>
-            <span className="badge badge-emerald">{executions.length} Verified</span>
+            <span className={`badge ${vault.isLiveOnChain ? "badge-emerald" : "badge-amber"}`}>
+              {vault.isLiveOnChain ? `${executions.length} On-Chain` : `${executions.length} Paper Fills`}
+            </span>
           </div>
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Pair</th>
-                <th>Notional</th>
-                <th>Realized Slip</th>
-                <th>Signal Hash</th>
-              </tr>
-            </thead>
-            <tbody>
-              {executions.slice(0, 5).map((ex) => (
-                <tr key={ex.id}>
-                  <td className="mono">#{ex.id}</td>
-                  <td>
-                    <strong>{ex.pair}</strong>{" "}
-                    <span className="badge badge-emerald">{ex.action}</span>
-                  </td>
-                  <td className="mono">${ex.notionalUsd.toLocaleString()}</td>
-                  <td className="mono text-emerald">{ex.slippageBps} bps</td>
-                  <td className="mono" style={{ fontSize: 11, color: "#94a3b8" }}>
-                    {ex.signalHash.slice(0, 14)}...{ex.signalHash.slice(-6)}
-                  </td>
+
+          {executions.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "10px 4px" }}>
+              No swaps recorded yet. Connect a deployed mainnet vault (or run a clearly labeled paper fill) to populate rows — zero fabricated transaction hashes are ever pre-seeded.
+            </div>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Pair</th>
+                  <th>Notional</th>
+                  <th>Mode</th>
+                  <th>Proof</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {executions.slice(0, 6).map((ex) => (
+                  <tr key={`${ex.mode}-${ex.id}-${ex.timestamp}`}>
+                    <td className="mono">#{ex.id}</td>
+                    <td>
+                      <strong>{ex.pair}</strong>{" "}
+                      <span className="badge badge-emerald">{ex.action}</span>
+                    </td>
+                    <td className="mono">${ex.notionalUsd.toFixed(2)}</td>
+                    <td>
+                      <span className={`badge ${ex.mode === "ON_CHAIN_TX" ? "badge-emerald" : "badge-amber"}`}>
+                        {ex.mode === "ON_CHAIN_TX" ? "ON-CHAIN" : "PAPER FILL"}
+                      </span>
+                    </td>
+                    <td className="mono" style={{ fontSize: 11 }}>
+                      {ex.txHash ? (
+                        <a
+                          className="link-subtle"
+                          href={`${HASHKEY_MAINNET.explorerUrl}/tx/${ex.txHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {ex.txHash.slice(0, 12)}... <ExternalLink size={10} />
+                        </a>
+                      ) : (
+                        <span className="text-muted">{ex.signalHash.slice(0, 14)}... (local)</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </div>

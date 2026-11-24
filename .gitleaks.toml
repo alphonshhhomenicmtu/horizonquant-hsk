@@ -1,0 +1,14 @@
+title = "HorizonQuant Gitleaks Policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public on-chain HashKey Chain (chainId 177) ERC-20 token and HSKSwap V3 contract addresses"
+paths = [
+  '''packages/agent/src/config/networks\.ts''',
+  '''packages/agent/src/rpc/hskTelemetry\.ts''',
+]
+regexes = [
+  '''0x[0-9a-fA-F]{40}''',
+]

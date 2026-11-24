@@ -74,33 +74,35 @@ function extractNumberAfter(input: string, patterns: RegExp[]): number | null {
   return null;
 }
 
-function extractTargetPairs(input: string): string[] {
+function extractTargetPairs(input: string): { livePairs: string[]; unavailablePairs: string[] } {
   const normalized = input.toUpperCase();
-  const pairs: string[] = [];
+  const livePairs: string[] = [];
+  const unavailablePairs: string[] = [];
   if (/(?:W?HSK\s*\/\s*USDT|HSK\s+MOMENTUM|HSK\s+PAIR|WHSK)/.test(normalized)) {
-    pairs.push("WHSK/USDT");
+    livePairs.push("WHSK/USDT");
   }
   if (/(?:W?ETH\s*\/\s*USDT|WETH|\bETH\b)/.test(normalized)) {
-    pairs.push("WETH/USDT");
+    unavailablePairs.push("WETH/USDT");
   }
   if (/(?:W?BTC\s*\/\s*USDT|WBTC|\bBTC\b)/.test(normalized)) {
-    pairs.push("WBTC/USDT");
+    unavailablePairs.push("WBTC/USDT");
   }
-  return Array.from(new Set(pairs));
+  return {
+    livePairs: Array.from(new Set(livePairs)),
+    unavailablePairs: Array.from(new Set(unavailablePairs)),
+  };
 }
 
 export function computeVaultNavUsd(vault: VaultRuntimeState, telemetry: ChainTelemetrySnapshot): number {
-  const whskPrice = telemetry.whskUsdtSpot;
-  return Number(
-    (
-      vault.balances.USDT +
-      vault.balances.WHSK * whskPrice +
-      vault.balances.WETH * 3240 +
-      vault.balances.WBTC * 96400
-    ).toFixed(2),
-  );
+  const whskPrice = telemetry.whskTwapUsdt || telemetry.whskUsdtSpot;
+  return Number((vault.balances.USDT + vault.balances.WHSK * whskPrice).toFixed(2));
 }
 
+/**
+ * Deterministic natural-language policy compiler.
+ * Translates plain-English risk parameters into ABI-encoded HorizonGuardVault calldata
+ * and enforces hard Solidity ceilings before wallet signing.
+ */
 export function parseAndExecuteCopilotCommand(
   rawCommand: string,
   currentVault: VaultRuntimeState,
@@ -124,7 +126,7 @@ export function parseAndExecuteCopilotCommand(
     return {
       intentType: "EMERGENCY_CONTROL",
       reply:
-        "Emergency pause armed. HorizonGuardVault.setPaused(true) calldata prepared — all autonomous EIP-712 TradeIntents are now halted while non-custodial owner withdrawals remain open.",
+        "Emergency pause compiled. HorizonGuardVault.setPaused(true) calldata is ready for owner wallet signature — autonomous EIP-712 swaps will revert with VaultIsPaused() while owner withdrawals remain open.",
       patch,
       warnings,
       rejectedConstraints,
@@ -153,7 +155,7 @@ export function parseAndExecuteCopilotCommand(
     return {
       intentType: "EMERGENCY_CONTROL",
       reply:
-        "Vault trading state restored. Circuit breaker reset and unpause calldata prepared with refreshed UTC daily high-water NAV baseline.",
+        "Vault recovery compiled. Circuit breaker reset and unpause calldata are ready for owner wallet signature with a refreshed UTC high-water NAV baseline.",
       patch,
       warnings,
       rejectedConstraints,
@@ -164,15 +166,15 @@ export function parseAndExecuteCopilotCommand(
 
   // 2. Stress test simulation
   if (/\b(simulate|stress\s*test|trip\s+circuit)\b/.test(lower) && /\b(drawdown|crash|loss|circuit)\b/.test(lower)) {
-    const simPct = extractNumberAfter(lower, [/(\d+(?:\.\d+)?)\s*%/]) ?? 3.4;
+    const simPct = extractNumberAfter(lower, [/(\d+(?:\.\d+)?)\s*%/]) ?? 3.5;
     const simBps = Math.round(simPct * 100);
     patch.simulateDrawdownBps = simBps;
     const willTrip = simBps >= currentVault.policy.dailyDrawdownCapBps;
     return {
       intentType: "STRESS_TEST",
       reply: willTrip
-        ? `Drawdown shock simulated at -${simPct.toFixed(2)}% (${simBps} bps >= ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap). HorizonGuardVault circuit breaker LATCHED — all agent swaps blocked on-chain until owner resets.`
-        : `Drawdown shock simulated at -${simPct.toFixed(2)}% (${simBps} bps). Still inside ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% daily stop-loss envelope; vault remains operational.`,
+        ? `Drawdown stress scenario simulated at -${simPct.toFixed(2)}% (${simBps} bps >= ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap). Circuit breaker LATCHED — all further swaps revert with CircuitBreakerActive() until owner calls resetCircuitBreaker().`
+        : `Drawdown stress scenario simulated at -${simPct.toFixed(2)}% (${simBps} bps). Still inside ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% daily stop-loss cap; vault remains armed.`,
       patch,
       warnings,
       rejectedConstraints,
@@ -181,21 +183,20 @@ export function parseAndExecuteCopilotCommand(
     };
   }
 
-  // 3. Arbitrage & Spread Scan Query
+  // 3. Arbitrage & Spread Scan Query (live pools only)
   if (
     /\b(scan|spot|check|find|show)\b/.test(lower) &&
     /\b(arb|arbitrage|spread|dislocation|tier|pool)\b/.test(lower) &&
     !/\b(cap|set|allocate|max|switch|change)\b/.test(lower)
   ) {
     const arbs = scanArbitrageOpportunities(telemetry, currentVault.balances.USDT, currentVault.policy.maxPositionBps);
-    const best = arbs.reduce((a, b) => (b.netEdgeBps > a.netEdgeBps ? b : a), arbs[0]);
-    const lines = arbs.map(
-      (a) =>
-        `• ${a.route}: gross ${a.grossSpreadBps} bps, fees ${a.poolFeesBps} bps, net ${a.netEdgeBps > 0 ? "+" : ""}${a.netEdgeBps} bps (${a.executable ? "EXECUTABLE" : "BELOW FEE HURDLE"})`,
-    );
+    const live = arbs[0];
     return {
       intentType: "ARB_SCAN",
-      reply: `HSKSwap V3 Spread Radar (Block #${telemetry.blockNumber.toLocaleString()}, Gas ${telemetry.gasPriceGwei} gwei):\n${lines.join("\n")}\nTop executable edge: ${best.route} at ${best.netEdgeBps > 0 ? "+" : ""}${best.netEdgeBps} bps net.`,
+      reply:
+        `HSKSwap V3 Live Spread Check (Block #${telemetry.blockNumber.toLocaleString()}, Gas ${telemetry.gasPriceGwei} gwei):\n` +
+        `• ${live.route}: gross ${live.grossSpreadBps.toFixed(1)} bps, fees ${live.poolFeesBps.toFixed(1)} bps, gas ${live.gasImpactBps.toFixed(1)} bps -> net ${live.netEdgeBps > 0 ? "+" : ""}${live.netEdgeBps.toFixed(1)} bps (${live.executable ? "EXECUTABLE" : "HOLD — BELOW FEE HURDLE"})\n` +
+        `• WETH/USDT & WBTC/USDT: Factory.getPool() returns address(0) on chainId 177 (excluded from execution).`,
       patch,
       warnings,
       rejectedConstraints,
@@ -215,11 +216,11 @@ export function parseAndExecuteCopilotCommand(
     return {
       intentType: "PORTFOLIO_QUERY",
       reply:
-        `Live Vault Telemetry (Chain ID ${telemetry.chainId} · Block #${telemetry.blockNumber.toLocaleString()}):\n` +
-        `• Total Vault NAV: $${nav.toLocaleString(undefined, { minimumFractionDigits: 2 })} | Mode: ${currentVault.strategyMode} (${currentVault.riskAppetite})\n` +
-        `• Holdings: ${currentVault.balances.USDT.toLocaleString()} USDT · ${currentVault.balances.WHSK.toLocaleString()} WHSK ($${(currentVault.balances.WHSK * telemetry.whskUsdtSpot).toFixed(0)}) · ${currentVault.balances.WETH} WETH · ${currentVault.balances.WBTC} WBTC\n` +
-        `• Daily Stop-Loss Buffer: ${(headroomBps / 100).toFixed(2)}% remaining (${(currentVault.currentDrawdownBps / 100).toFixed(2)}% / ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap)\n` +
-        `• Active Guardrails: Max Slippage ${currentVault.policy.maxSlippageBps} bps · Max Position ${(currentVault.policy.maxPositionBps / 100).toFixed(1)}% · Cooldown ${currentVault.policy.minTradeIntervalSec}s · ${currentVault.dailyTradeCount}/${currentVault.policy.maxDailyTrades} daily trades.`,
+        `Vault Telemetry (Chain ID ${telemetry.chainId} · Block #${telemetry.blockNumber.toLocaleString()} · ${currentVault.isLiveOnChain ? "ON-CHAIN VAULT" : "PRE-DEPLOY SANDBOX"}):\n` +
+        `• Vault NAV: $${nav.toLocaleString(undefined, { minimumFractionDigits: 2 })} | Mode: ${currentVault.strategyMode} (${currentVault.riskAppetite})\n` +
+        `• Live Assets: ${currentVault.balances.USDT.toLocaleString()} USDT · ${currentVault.balances.WHSK.toLocaleString()} WHSK (@ $${telemetry.whskTwapUsdt.toFixed(6)} 5m TWAP)\n` +
+        `• Stop-Loss Headroom: ${(headroomBps / 100).toFixed(2)}% remaining (${(currentVault.currentDrawdownBps / 100).toFixed(2)}% / ${(currentVault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap)\n` +
+        `• Guardrails: Max Slippage ${currentVault.policy.maxSlippageBps} bps (oracle floor) · Max Pos ${(currentVault.policy.maxPositionBps / 100).toFixed(1)}% · Cooldown ${currentVault.policy.minTradeIntervalSec}s · ${currentVault.dailyTradeCount}/${currentVault.policy.maxDailyTrades} daily swaps.`,
       patch,
       warnings,
       rejectedConstraints,
@@ -228,11 +229,10 @@ export function parseAndExecuteCopilotCommand(
     };
   }
 
-  // 5. Natural-Language Risk Policy & Strategy Mutation
+  // 5. Deterministic Policy & Strategy Compilation
   const nextPolicy: RiskPolicyConfig = { ...currentVault.policy };
   const policyChanges: string[] = [];
 
-  // Risk appetite preset first (explicit numeric parameters below override preset defaults)
   if (/\bconservative|defensive|low\s+risk\b/.test(lower)) {
     patch.riskAppetite = "CONSERVATIVE";
     Object.assign(nextPolicy, RISK_PRESETS.CONSERVATIVE);
@@ -247,7 +247,6 @@ export function parseAndExecuteCopilotCommand(
     policyChanges.push("Risk Appetite -> BALANCED");
   }
 
-  // Strategy regime mode
   if (/\bmomentum|trend\b/.test(lower)) {
     patch.strategyMode = "MOMENTUM";
     policyChanges.push("Strategy -> MOMENTUM");
@@ -262,7 +261,6 @@ export function parseAndExecuteCopilotCommand(
     policyChanges.push("Strategy -> HYBRID");
   }
 
-  // Daily loss / drawdown cap
   const drawdownPct = extractNumberAfter(lower, [
     /(?:daily\s+loss|drawdown|stop[\s-]?loss)[^\d]{0,20}(\d+(?:\.\d+)?)\s*%/,
     /cap\s+(?:daily\s+)?(?:loss|drawdown)\s+(?:at|to)\s+(\d+(?:\.\d+)?)\s*%/,
@@ -271,7 +269,7 @@ export function parseAndExecuteCopilotCommand(
     const ddBps = Math.round(drawdownPct * 100);
     if (ddBps <= 0 || ddBps > PROTOCOL_HARD_LIMITS.MAX_DRAWDOWN_BPS) {
       rejectedConstraints.push(
-        `Daily drawdown cap ${drawdownPct}% violates HorizonGuardVault hard limit (0.01% - 25.00%).`,
+        `Daily drawdown cap ${drawdownPct}% violates HorizonGuardVault HARD_MAX_DRAWDOWN_BPS (0.01% - 25.00%).`,
       );
     } else {
       nextPolicy.dailyDrawdownCapBps = ddBps;
@@ -279,7 +277,6 @@ export function parseAndExecuteCopilotCommand(
     }
   }
 
-  // Max position allocation %
   const posPct = extractNumberAfter(lower, [
     /(?:allocate|position(?:\s+size)?|max\s+position|sizing)[^\d]{0,18}(\d+(?:\.\d+)?)\s*%/,
     /(\d+(?:\.\d+)?)\s*%\s+(?:max\s+)?(?:position|allocation|size)/,
@@ -297,7 +294,6 @@ export function parseAndExecuteCopilotCommand(
     }
   }
 
-  // Slippage cap (bps or %)
   const slipBps = extractNumberAfter(lower, [
     /(\d+(?:\.\d+)?)\s*bps\s*(?:max\s+)?slippage/,
     /slippage[^\d]{0,18}(\d+(?:\.\d+)?)\s*bps/,
@@ -322,7 +318,6 @@ export function parseAndExecuteCopilotCommand(
     }
   }
 
-  // Trade frequency / cooldown
   const intervalMin = extractNumberAfter(lower, [
     /(?:every|cooldown|interval)[^\d]{0,12}(\d+(?:\.\d+)?)\s*(?:min|mins|minutes|m\b)/,
   ]);
@@ -332,12 +327,15 @@ export function parseAndExecuteCopilotCommand(
       : null;
 
   if (intervalMin !== null || intervalSec !== null) {
-    const secs = Math.max(
-      PROTOCOL_HARD_LIMITS.MIN_COOLDOWN_SEC,
-      Math.round(intervalMin !== null ? intervalMin * 60 : intervalSec!),
-    );
-    nextPolicy.minTradeIntervalSec = secs;
-    policyChanges.push(`Min Trade Interval -> ${secs}s`);
+    const rawSecs = Math.round(intervalMin !== null ? intervalMin * 60 : intervalSec!);
+    if (rawSecs < PROTOCOL_HARD_LIMITS.MIN_COOLDOWN_SEC) {
+      rejectedConstraints.push(
+        `Cooldown ${rawSecs}s violates Solidity MIN_TRADE_INTERVAL_SEC (${PROTOCOL_HARD_LIMITS.MIN_COOLDOWN_SEC}s floor).`,
+      );
+    } else {
+      nextPolicy.minTradeIntervalSec = rawSecs;
+      policyChanges.push(`Min Trade Interval -> ${rawSecs}s`);
+    }
   }
 
   const maxTrades = extractNumberAfter(lower, [
@@ -349,11 +347,15 @@ export function parseAndExecuteCopilotCommand(
     policyChanges.push(`Max Daily Trades -> ${Math.round(maxTrades)}/day`);
   }
 
-  // Target assets / pairs
-  const pairs = extractTargetPairs(text);
-  if (pairs.length > 0) {
-    patch.targetPairs = pairs;
-    policyChanges.push(`Target Assets -> ${pairs.join(", ")}`);
+  const { livePairs, unavailablePairs } = extractTargetPairs(text);
+  if (unavailablePairs.length > 0) {
+    warnings.push(
+      `Skipped ${unavailablePairs.join(", ")}: HSKSwap V3 Factory.getPool() returns address(0) on chainId 177. Active allowlist restricted to live WHSK/USDT pools.`,
+    );
+  }
+  if (livePairs.length > 0) {
+    patch.targetPairs = livePairs;
+    policyChanges.push(`Target Market -> ${livePairs.join(", ")}`);
   }
 
   const policyMutated =
@@ -372,11 +374,11 @@ export function parseAndExecuteCopilotCommand(
     });
   }
 
-  if (policyChanges.length === 0 && rejectedConstraints.length === 0) {
+  if (policyChanges.length === 0 && rejectedConstraints.length === 0 && warnings.length === 0) {
     return {
       intentType: "PORTFOLIO_QUERY",
       reply:
-        "No policy delta detected. Try commands like: \"Cap daily loss at 3%, allocate 25% into HSK/USDT momentum with 50bps max slippage\", \"Scan HSKSwap spread arbitrage\", or \"Show live positions and PnL\".",
+        "Deterministic policy compiler found no policy delta. Try: \"Cap daily loss at 2.5%, allocate 20% into WHSK/USDT momentum with 40bps max slippage\", \"Scan HSKSwap spread\", or \"Show live positions and NAV\".",
       patch,
       warnings,
       rejectedConstraints,
@@ -387,14 +389,17 @@ export function parseAndExecuteCopilotCommand(
 
   const summaryParts: string[] = [];
   if (policyChanges.length > 0) {
-    summaryParts.push(`Updated strategy & vault risk guardrails:\n• ${policyChanges.join("\n• ")}`);
+    summaryParts.push(`Compiled policy changes:\n• ${policyChanges.join("\n• ")}`);
+  }
+  if (warnings.length > 0) {
+    summaryParts.push(`Market reality notes:\n• ${warnings.join("\n• ")}`);
   }
   if (rejectedConstraints.length > 0) {
-    summaryParts.push(`On-chain invariant rejections:\n• ${rejectedConstraints.join("\n• ")}`);
+    summaryParts.push(`Solidity invariant rejections:\n• ${rejectedConstraints.join("\n• ")}`);
   }
   if (onChainActions.length > 0) {
     summaryParts.push(
-      `Ready for owner signature on HorizonGuardVault.updateRiskPolicy (Chain ID ${telemetry.chainId}).`,
+      `Ready for owner wallet signature on HorizonGuardVault.updateRiskPolicy (Chain ID ${telemetry.chainId}).`,
     );
   }
 

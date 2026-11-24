@@ -5,8 +5,6 @@ import {IERC20Minimal, ISwapRouter, IUniswapV3PoolMinimal} from "./interfaces/IS
 
 /// @title MockHSKSwapRouter
 /// @notice Deterministic HSKSwap V3 SwapRouter simulator for local Foundry and HSK Chain Testnet (133) validation.
-/// @dev Matches the exact verified HSKSwap SwapRouter v1 ABI (`exactInputSingle` with `deadline`) and supports
-///      configurable per-pair exchange rates, fee deductions, and adversarial slippage injection.
 contract MockHSKSwapRouter is ISwapRouter {
     uint256 public constant RATE_SCALE = 1e18;
     uint256 public constant BPS_DENOMINATOR = 10_000;
@@ -19,6 +17,7 @@ contract MockHSKSwapRouter is ISwapRouter {
     mapping(address => mapping(address => uint256)) public rateE18;
     // Simulated extra execution slippage in bps (e.g., 25 = 0.25% adverse fill)
     uint16 public simulatedSlippageBps;
+    uint160 public lastSqrtPriceLimitX96;
 
     event MockSwapExecuted(
         address indexed sender,
@@ -58,6 +57,8 @@ contract MockHSKSwapRouter is ISwapRouter {
         uint256 rate = rateE18[params.tokenIn][params.tokenOut];
         if (rate == 0) revert UnconfiguredRate();
 
+        lastSqrtPriceLimitX96 = params.sqrtPriceLimitX96;
+
         require(
             IERC20Minimal(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn),
             "TRANSFER_IN_FAILED"
@@ -79,7 +80,7 @@ contract MockHSKSwapRouter is ISwapRouter {
 }
 
 /// @title MockV3Pool
-/// @notice Deterministic HSKSwap V3 pool mock exposing `slot0()`, `token0()`, `token1()`, `fee()`, and `liquidity()`.
+/// @notice Deterministic HSKSwap V3 pool mock exposing `slot0()`, `observe()`, `liquidity()`, and cardinality growth.
 contract MockV3Pool is IUniswapV3PoolMinimal {
     address public immutable override token0;
     address public immutable override token1;
@@ -87,18 +88,48 @@ contract MockV3Pool is IUniswapV3PoolMinimal {
     uint128 public override liquidity;
     uint160 public currentSqrtPriceX96;
     int24 public currentTick;
+    int24 public twapTick;
+    uint16 public observationCardinality = 16;
+    bool public unlocked = true;
 
-    constructor(address token0_, address token1_, uint24 fee_, uint160 sqrtPriceX96_, uint128 liquidity_) {
+    constructor(
+        address token0_,
+        address token1_,
+        uint24 fee_,
+        uint160 sqrtPriceX96_,
+        int24 initialTick_,
+        uint128 liquidity_
+    ) {
         token0 = token0_;
         token1 = token1_;
         fee = fee_;
         currentSqrtPriceX96 = sqrtPriceX96_;
+        currentTick = initialTick_;
+        twapTick = initialTick_;
         liquidity = liquidity_;
     }
 
     function setSqrtPriceX96(uint160 newSqrtPriceX96, int24 newTick) external {
         currentSqrtPriceX96 = newSqrtPriceX96;
         currentTick = newTick;
+    }
+
+    function setTwapTick(int24 newTwapTick) external {
+        twapTick = newTwapTick;
+    }
+
+    function setLiquidity(uint128 newLiquidity) external {
+        liquidity = newLiquidity;
+    }
+
+    function setUnlocked(bool isUnlocked) external {
+        unlocked = isUnlocked;
+    }
+
+    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external override {
+        if (observationCardinalityNext > observationCardinality) {
+            observationCardinality = observationCardinalityNext;
+        }
     }
 
     function slot0()
@@ -109,12 +140,28 @@ contract MockV3Pool is IUniswapV3PoolMinimal {
             uint160 sqrtPriceX96,
             int24 tick,
             uint16 observationIndex,
-            uint16 observationCardinality,
-            uint16 observationCardinalityNext,
+            uint16 obsCardinality,
+            uint16 obsCardinalityNext,
             uint8 feeProtocol,
-            bool unlocked
+            bool isUnlocked
         )
     {
-        return (currentSqrtPriceX96, currentTick, 0, 1, 1, 0, true);
+        return (currentSqrtPriceX96, currentTick, 0, observationCardinality, observationCardinality, 0, unlocked);
+    }
+
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        override
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s)
+    {
+        uint256 len = secondsAgos.length;
+        tickCumulatives = new int56[](len);
+        secondsPerLiquidityCumulativeX128s = new uint160[](len);
+        int56 baseCumulative = int56(twapTick) * int56(uint56(block.timestamp));
+        for (uint256 i = 0; i < len; ++i) {
+            tickCumulatives[i] = baseCumulative - (int56(twapTick) * int56(uint56(secondsAgos[i])));
+            secondsPerLiquidityCumulativeX128s[i] = 0;
+        }
     }
 }

@@ -1,14 +1,25 @@
-import { RefreshCw, ShieldAlert, ShieldCheck, Zap } from "lucide-react";
+import { RefreshCw, ShieldAlert, ShieldCheck, Wallet, Zap } from "lucide-react";
 import type { ChainTelemetrySnapshot, VaultRuntimeState } from "@horizonquant/agent";
 
 interface TopTelemetryBarProps {
   telemetry: ChainTelemetrySnapshot;
   vault: VaultRuntimeState;
+  walletAddress: string | null;
+  walletChainId: number | null;
   refreshing: boolean;
   onRefresh: () => void;
+  onConnectWallet: () => void;
 }
 
-export function TopTelemetryBar({ telemetry, vault, refreshing, onRefresh }: TopTelemetryBarProps) {
+export function TopTelemetryBar({
+  telemetry,
+  vault,
+  walletAddress,
+  walletChainId,
+  refreshing,
+  onRefresh,
+  onConnectWallet,
+}: TopTelemetryBarProps) {
   const isLive = telemetry.source === "LIVE_RPC";
   const statusClass = vault.circuitBreakerTripped
     ? "pill-danger"
@@ -16,10 +27,12 @@ export function TopTelemetryBar({ telemetry, vault, refreshing, onRefresh }: Top
       ? "pill-warn"
       : "pill-live";
   const statusLabel = vault.circuitBreakerTripped
-    ? "CIRCUIT BREAKER LATCHED"
+    ? "BREAKER LATCHED"
     : vault.paused
       ? "VAULT PAUSED"
-      : "GUARD VAULT ARMED";
+      : vault.isLiveOnChain
+        ? "ON-CHAIN VAULT"
+        : "PRE-DEPLOY GUARD";
 
   return (
     <header className="topbar">
@@ -33,7 +46,7 @@ export function TopTelemetryBar({ telemetry, vault, refreshing, onRefresh }: Top
             <span className="badge badge-cyan">HSK Chain · Track 1</span>
           </div>
           <div className="brand-sub">
-            Session-Key AI Trading &amp; Risk Vault · Chain ID {telemetry.chainId}
+            TWAP-Guarded Session-Key Vault &amp; Decision Ledger · Chain ID {telemetry.chainId}
           </div>
         </div>
       </div>
@@ -45,14 +58,14 @@ export function TopTelemetryBar({ telemetry, vault, refreshing, onRefresh }: Top
           <strong className="mono">#{telemetry.blockNumber.toLocaleString()}</strong>
         </div>
 
-        <div className="pill">
-          <span>WHSK/USDT</span>
-          <strong className="mono text-cyan">${telemetry.whskUsdtSpot.toFixed(6)}</strong>
+        <div className="pill" title="Live WHSK/USDT 0.05% spot and 5m TWAP">
+          <span>WHSK 5m TWAP</span>
+          <strong className="mono text-cyan">${telemetry.whskTwapUsdt.toFixed(6)}</strong>
         </div>
 
-        <div className="pill">
+        <div className="pill" title="Live 0.05% vs 0.30% gross spread vs 35 bps fee hurdle">
           <span>Spread</span>
-          <strong className="mono text-emerald">{telemetry.crossTierSpreadBps.toFixed(1)} bps</strong>
+          <strong className="mono text-amber">{telemetry.crossTierSpreadBps.toFixed(1)} bps</strong>
         </div>
 
         <div className="pill">
@@ -64,6 +77,17 @@ export function TopTelemetryBar({ telemetry, vault, refreshing, onRefresh }: Top
           {vault.circuitBreakerTripped || vault.paused ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}
           <strong>{statusLabel}</strong>
         </div>
+
+        <button
+          className={`btn btn-sm ${walletAddress ? "btn-emerald" : "btn-primary"}`}
+          onClick={onConnectWallet}
+          title="Connect EIP-1193 wallet on HashKey Chain Mainnet (chainId 177)"
+        >
+          <Wallet size={12} />
+          {walletAddress
+            ? `${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}${walletChainId === 177 ? " (177)" : ""}`
+            : "Connect Wallet"}
+        </button>
 
         <button className="btn btn-sm" onClick={onRefresh} disabled={refreshing} title="Poll live HashKey Chain Mainnet RPC">
           <RefreshCw size={12} />

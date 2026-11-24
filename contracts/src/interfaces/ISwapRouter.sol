@@ -24,7 +24,7 @@ interface ISwapRouter {
 }
 
 /// @title IUniswapV3PoolMinimal
-/// @notice Minimal read interface for HashKey Chain HSKSwap V3 concentrated liquidity pools.
+/// @notice Minimal interface for HashKey Chain HSKSwap V3 pools including TWAP `observe()`.
 interface IUniswapV3PoolMinimal {
     function token0() external view returns (address);
 
@@ -46,6 +46,13 @@ interface IUniswapV3PoolMinimal {
             uint8 feeProtocol,
             bool unlocked
         );
+
+    function observe(uint32[] calldata secondsAgos)
+        external
+        view
+        returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+
+    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) external;
 }
 
 /// @title IERC20Minimal

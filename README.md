@@ -1,12 +1,12 @@
 # HorizonQuant Agent
 
-**Non-Custodial Session-Key AI Trading & On-Chain Risk Vault on HashKey Chain (`chainId 177`)**
+**Non-Custodial TWAP-Guarded Session-Key Trading Vault & Decision Ledger on HashKey Chain (`chainId 177`)**
 
 Built for **DoraHacks HSK Chain Horizon Hackathon · Seoul — Track 1: AI Agent Trading**.
 
-**Live Terminal (GitHub Pages)**: [https://alphonshhhomenicmtu.github.io/horizonquant-hsk/](https://alphonshhhomenicmtu.github.io/horizonquant-hsk/)
+**Live Web Terminal (GitHub Pages)**: [https://alphonshhhomenicmtu.github.io/horizonquant-hsk/](https://alphonshhhomenicmtu.github.io/horizonquant-hsk/)
 
-HorizonQuant separates **autonomous alpha generation** (off-chain regime momentum, mean-reversion, and live HSKSwap V3 cross-fee-tier spread detection) from **hard risk enforcement** (on-chain `HorizonGuardVault.sol` enforcing EIP-712 session keys, per-trade slippage ceilings, max position sizing, rolling UTC 24h high-water daily drawdown circuit breakers, and strict HSKSwap router/pair allowlists). Even if an off-chain AI model hallucinates or market liquidity collapses, the smart contract refuses unsafe trades at the EVM level.
+HorizonQuant splits off-chain market monitoring and deterministic policy compilation from hard EVM risk enforcement inside `HorizonGuardVault.sol`. The owner keeps full cold custody of vault funds; the trading agent holds only a scoped EIP-712 session key that can never equal the owner, withdraw capital, bypass the on-chain TWAP slippage floor, or push past daily loss limits.
 
 ---
 
@@ -14,75 +14,77 @@ HorizonQuant separates **autonomous alpha generation** (off-chain regime momentu
 
 ```mermaid
 flowchart LR
-    U["Trader / Portfolio Owner"] -->|"Natural-Language Risk & Strategy Commands"| UI["HorizonQuant Terminal (React + Vite)"]
-    UI -->|"Parsed Policy Diff + ABI Calldata"| CP["Conversational Copilot Engine"]
-    UI -->|"Live slot0() / liquidity() / gasPrice"| RPC["HashKey Chain Mainnet RPC (chainId 177)"]
+    U["Cold Owner / Portfolio Operator"] -->|"Plain-English Risk Directives"| UI["HorizonQuant Terminal (React + Vite + Viem)"]
+    UI -->|"Deterministic Policy Compiler -> ABI Calldata"| WALLET["EIP-1193 Wallet (Chain ID 177)"]
+    UI -->|"Live slot0() / liquidity() / observe([300,0]) / Factory.getPool()"| RPC["HashKey Chain Mainnet RPC (177)"]
 
-    RPC -->|"WHSK/USDT 0.05% & 0.30% Pools"| SE["Quant Signal & Spread Engine"]
-    SE -->|"EMA / RSI / Bollinger Z + Cross-Tier Arb"| SIGN["Scoped Agent Session Key (EIP-712)"]
+    RPC -->|"WHSK/USDT 0.05% & 0.30% Pools"| LEDGER["Public Decision Ledger (Act vs Hold)"]
+    LEDGER -->|"Depth-Capped Signal + Signal Hash"| SIGN["Scoped Session Key (EIP-712, != Owner)"]
 
-    CP -->|"Owner-Signed updateRiskPolicy / pause / resetCB"| VAULT["HorizonGuardVault.sol (Solidity 0.8.28)"]
+    WALLET -->|"Owner Tx: updateRiskPolicy / setPaused / resetCircuitBreaker"| VAULT["HorizonGuardVault.sol (Solidity 0.8.29)"]
     SIGN -->|"executeGuardedSwap(TradeIntent, sig)"| VAULT
 
-    VAULT -->|"1. EIP-712 + Low-S + Nonce\n2. Slippage <= Cap\n3. Pos <= MaxPosBps\n4. Daily Drawdown CB\n5. Exact Zero-Residual Approval"| DEX["HSKSwap V3 SwapRouter\n0x1f3858C4...228C5cddc64"]
-    DEX -->|"Verified Token Output"| VAULT
-    VAULT -->|"Immutable ExecutionRecord[] + TradeExecuted"| EXP["HashKey Blockscout Explorer"]
+    VAULT -->|"1. Pinned 5m V3 TWAP + Deviation & TTL\n2. Independent Oracle minAmountOut Floor\n3. Non-Zero Directional sqrtPriceLimitX96\n4. Pro-Rata High-Water Drawdown Breaker\n5. Zero-Residual Exact Approval"| DEX["HSKSwap V3 SwapRouter\n0x1f3858C4...228C5cddc64"]
+    DEX -->|"Verified Balance Delta"| VAULT
+    VAULT -->|"ExecutionRecord[] + TradeExecuted"| EXP["HashKey Blockscout Explorer"]
 ```
 
 ---
 
-## Live Verified HashKey Chain Mainnet (`177`) Integration
+## Live Verified HashKey Chain Mainnet (`177`) Pool Reality
 
-Every external contract interface was probed live against `https://mainnet.hsk.xyz` and `https://hsk.blockscout.com`:
+Every contract address and pool was probed live against `https://mainnet.hsk.xyz` at block `30,589,426` (`500.001 gwei` base fee):
 
-| Component | Mainnet Address (`chainId 177`) | Verification Notes |
+| Component | Mainnet Address (`chainId 177`) | Live RPC Probe Result |
 |---|---|---|
-| **HSKSwap V3 `SwapRouter`** | `0x1f3858C46F8F6fE76260b8208995D228C5cddc64` | Verified Uniswap V3 `SwapRouter` v1 ABI (`exactInputSingle` includes `deadline`) |
-| **HSKSwap V3 `Factory`** | `0xD136e36610f35E0Cc3cAd40de858c151f2AA65D4` | Live pool registry for `WHSK/USDT` fee tiers |
-| **`WHSK` (Wrapped HSK, 18 dec)** | `0xB210D2120d57b758EE163cFfb43e73728c471Cf1` | Official HSK Chain wrapped native gas token |
-| **`USDT` (Tether USD, 6 dec)** | `0xF1B50eD67A9e2CC94Ad3c477779E2d4cBfFf9029` | Vault quote currency & NAV settlement base |
-| **`WETH` (Wrapped Ether, 18 dec)** | `0xefd4bC9afD210517803f293ABABd701CaeeCdfd0` | Allowlisted major trading asset |
-| **`WBTC` (Wrapped Bitcoin, 8 dec)** | `0x6119ca49a79f5825c8b345f8d7ac36b272565b14` | Allowlisted major trading asset |
-| **`WHSK/USDT` Pool (`0.05%`)** | `0xEB33d6666dd2359cB1BF6Ea6D72286Cc1b4a778A` | Live spot `0.100013 USDT`, liquidity `2,830,955,089,632` |
-| **`WHSK/USDT` Pool (`0.30%`)** | `0x0767F7b1af495D245EA00219cFB8B2Ed6EafAe62` | Live spot `0.100193 USDT`, liquidity `950,573,096,369` (`18.0 bps` live spread) |
+| **HSKSwap V3 `SwapRouter`** | `0x1f3858C46F8F6fE76260b8208995D228C5cddc64` | Verified Uniswap V3 `SwapRouter` v1 ABI (`exactInputSingle` with `deadline`) |
+| **HSKSwap V3 `Factory`** | `0xD136e36610f35E0Cc3cAd40de858c151f2AA65D4` | Live pool registry probed across `100 / 500 / 3000 / 10000` fee tiers |
+| **`WHSK` (Wrapped HSK, 18 dec)** | `0xB210D2120d57b758EE163cFfb43e73728c471Cf1` | Primary traded asset |
+| **`USDT` (Tether USD, 6 dec)** | `0xF1B50eD67A9e2CC94Ad3c477779E2d4cBfFf9029` | Vault quote currency & NAV base |
+| **`WHSK/USDT` Pool (`0.05%`)** | `0xEB33d6666dd2359cB1BF6Ea6D72286Cc1b4a778A` | **LIVE** — Spot & 5m TWAP `$0.100013`, `L = 2,830,955,089,632`, `observe([300, 0])` verified |
+| **`WHSK/USDT` Pool (`0.30%`)** | `0x0767F7b1af495D245EA00219cFB8B2Ed6EafAe62` | **LIVE** — Spot & 5m TWAP `$0.100193`, `L = 950,573,096,369` (`~18.0 bps` gross spread vs `35.0 bps` combined fee hurdle -> agent explicitly **HOLDS**) |
+| **`WETH/USDT`, `WBTC/USDT`, `WHSK/WETH`** | `Factory.getPool(...) == address(0)` | **Excluded from vault allowlist** — token contracts exist on chain `177`, but no active HSKSwap V3 pools exist yet |
+| **Deployer EOA (Funding Target)** | `0x57A46E4E5F538452E4D672EF9D48e3e90E10A81C` | Ready for 1-command broadcast once `~3-5 HSK` gas arrives |
 
 ---
 
-## Smart Contract Security Guarantees (`HorizonGuardVault.sol`)
+## Pre-Deploy Security Hardening & Audit Verification
 
-1. **Non-Custodial Ownership**: Only `owner` can `deposit`, `withdraw`, `emergencyWithdraw`, `setPaused`, `updateRiskPolicy`, or rotate session keys. The AI agent signer can **never** withdraw funds or alter risk caps.
-2. **EIP-712 Signed `TradeIntent` + Low-S Malleability Guard**: Domain-bound (`name="HorizonGuardVault"`, `version="1"`, `chainId=177`) intents verified via `ecrecover` with `s <= secp256k1.n / 2`, strict `deadline`, and monotonic per-agent `nonces`.
-3. **Hard Slippage Ceiling (`HARD_MAX_SLIPPAGE_BPS = 500`)**: Rejects both over-permissive agent intents (`intent.maxSlippageBps > policy.maxSlippageBps`) and adverse DEX execution fills (`amountOut < minAmountOut`).
-4. **Max Position Size & Session Volume Cap**: Bounds each trade to `tokenInBalance * maxPositionBps / 10_000` and tracks cumulative session notional against `maxCumulativeVolumeQuoteE18`.
-5. **Rolling UTC 24h High-Water Daily Drawdown Circuit Breaker**: Normalizes owner deposits/withdrawals so capital flows never trigger false alarms, supports permissionless `syncPriceFromV3Pool()` directly from HSKSwap V3 `slot0()`, and permanently latches `circuitBreakerTripped = true` upon breaching `dailyDrawdownCapBps` until owner review and `resetCircuitBreaker()`.
-6. **Zero-Residual Exact Approvals & Verifiable Audit Trail**: Approves exact `amountIn` before `exactInputSingle`, resets router allowance to `0` immediately after, and stores every swap's `strategyTag` and `signalHash` in `ExecutionRecord[]`.
+`HorizonGuardVault.sol` was audited with a full local white-box Web3 toolchain (**Foundry Unit + Fuzz + Stateful Invariant Fuzzing**, **Aderyn v0.6.8**, **Slither v0.11.6**, and **Gitleaks v8.30.1**):
+
+1. **Protected TWAP Oracle & Authorized Keepers**: Replaced permissionless spot `slot0()` sync with `setOraclePool(...)` (owner-pinned canonical V3 pools only), `onlyOwnerOrKeeper` access control on `syncPriceFromV3Pool(address token)`, Uniswap V3 `observe([twapWindowSec, 0])` TWAP + `TickMath`, minimum active liquidity floor, spot-vs-TWAP flash-manipulation check, step-change deviation bound, and hard `maxStalenessSec` TTL (`OraclePriceStale`).
+2. **Independent On-Chain Oracle Slippage Floor**: Never trusts agent-supplied `expectedAmountOut` or `minAmountOut` down to 1 wei. The vault independently computes `oracleFairOut` and `oracleMinOut` from the freshness-checked pinned TWAP oracle, reverts with `MinAmountOutBelowOracleFloor` if an intent undercuts that floor, measures realized slippage against the on-chain oracle quote, and passes a non-zero directional `sqrtPriceLimitX96` to `SwapRouter.exactInputSingle`.
+3. **Pro-Rata High-Water NAV Scaling**: `deposit()` and `withdraw()` scale `dayStartNavE18` and `dayHighWaterNavE18` pro-rata (`baseline * navAfter / navBefore`, rounded up for safety) so inflows never dilute trading losses and withdrawals never falsely trip the drawdown circuit breaker. Pre-trade drawdown breaches revert immediately (`DailyDrawdownExceeded`); post-trade breaches and `checkAndTripCircuitBreaker()` persistently latch `circuitBreakerTripped` until owner reset.
+4. **Cold-Owner / Hot-Session Separation & Hard Policy Floors**: Enforces `agent != owner` (`AgentCannotBeOwner`), `minTradeIntervalSec >= 10` seconds (`MIN_TRADE_INTERVAL_SEC`), signed `intent.deadline <= block.timestamp + 15 minutes` (`IntentDeadlineTooFar`), low-`s` EIP-712 recovery, monotonic nonces, zero-residual router allowances, full `nonReentrant` guards, and `rescueNative()` for forced native HSK recovery.
+5. **Static Analysis & Invariant Results**:
+   - **Foundry (`forge test -vv`)**: `28/28` tests passing — 22 unit & adversarial red-team regression tests, 5 stateless fuzz tests (`1,280` runs), and 5 **stateful invariants** across `128` runs × `32` depth (`4,096` multi-actor calls with 0 invariant violations).
+   - **Runtime Bytecode Size**: `20,139` bytes (`4,437` bytes below the `24,576`-byte EIP-170 limit).
+   - **Aderyn v0.6.8**: `0` real High/Medium findings (its single `H-1` state-change-after-call detector flags `nonReentrant`-protected balance-delta reads in `executeGuardedSwap`, `emergencyWithdraw`, and `setOraclePool`).
+   - **Slither v0.11.6**: `0` exploitable High/Medium issues (remaining items triaged as known Remco Bloemen FullMath `xor(3*d, 2)` / `TickMath` bit-shift patterns, `nonReentrant` post-swap balance diffs, and explicit zero guards).
+   - **Gitleaks v8.30.1**: `0` secrets leaked across git history.
 
 ---
 
-## Screenshots (Retina `2880×1800` QA Verified)
+## Key Terminal Features
 
-| Live Command & Risk Terminal | Copilot & EIP-712 Intent Studio |
-|---|---|
-| ![Command Terminal](docs/screenshots/01-command-terminal.png) | ![Copilot & EIP-712 Studio](docs/screenshots/02-copilot-eip712-studio.png) |
-
-| HSKSwap Arbitrage & Backtest Attribution | On-Chain Vault Security & Mainnet Deploy |
-|---|---|
-| ![Arbitrage & Backtest](docs/screenshots/03-hskswap-arb-backtest.png) | ![Vault Security & Mainnet Deploy](docs/screenshots/04-vault-security-mainnet.png) |
+- **Public Agent Decision Ledger (Act vs Hold)**: Every RPC poll from `https://mainnet.hsk.xyz` appends a timestamped decision record showing live `0.05%` vs `0.30%` pool prices, 5-minute TWAP divergence, gross spread vs `35 bps` fee hurdle, 2% active liquidity depth, and exact numeric rationale for acting or holding.
+- **Interactive Adversarial Breaker Lab**: One-click exploit buttons (`1-Wei Slippage`, `Stale Oracle`, `Unauthorized Keeper / Fake Pool`, `+25% Spot Flash Spike`, `Oversized Position`) that display exact malicious ABI calldata, the 4-byte Solidity custom error selector, and run live `eth_call` verification when attached to a deployed vault.
+- **Real Wallet Execution + Live Vault Inspector**: Connect MetaMask / Rabby on `chainId 177` and attach any deployed vault (`?vault=0x...`) to read real balances, `policy()`, `session()`, and `ExecutionRecord[]`, sign real EIP-712 `TradeIntent` payloads, and broadcast transactions directly to HashKey Chain Mainnet. Pre-deploy local actions are explicitly marked `PAPER FILL`.
+- **Illustrative Stress Scenario Model**: Clearly labeled 30-day synthetic stress scenario comparing tail-risk drawdown and adverse slippage protection with vs without `HorizonGuardVault` (no synthetic historical Sharpe claims).
 
 ---
 
 ## Quick Start & Verification
 
-### 1. Foundry Smart Contract Tests (Unit + 1,024 Fuzz Runs)
+### 1. Foundry Unit, Fuzz & Stateful Invariant Tests
 
 ```bash
 cd contracts
+forge build --sizes
 forge test -vv
 ```
 
-Verified result: **21/21 tests passing** (17 unit tests + 4 fuzz suites × 256 runs covering max position size, slippage guardrails, session notional budgets, and daily drawdown circuit breaker thresholds).
-
-### 2. TypeScript Agent, Copilot & Attribution Tests + Production Build
+### 2. TypeScript Agent Tests, Typecheck & Production Web Build
 
 ```bash
 npm install
@@ -91,68 +93,32 @@ npm run typecheck
 npm run build
 ```
 
-Verified result: **18/18 Vitest tests passing**, zero TypeScript errors, clean static production bundle in `apps/web/dist/` (ready for GitHub Pages or local preview).
-
-### 3. Run Locally (Terminal + Live Telemetry API)
+### 3. Run Locally
 
 ```bash
-# Terminal UI (connects live to HashKey Chain Mainnet RPC)
+# Static terminal UI (direct browser RPC to HashKey Chain Mainnet 177)
 npm run dev:web
 
-# Optional Node Telemetry & Copilot API Server (http://127.0.0.1:8787)
+# Optional Node API & telemetry server (http://127.0.0.1:8787)
 npm run dev:api
 ```
 
-### 4. One-Command Deployment (HashKey Chain Mainnet `177` & Testnet `133`)
+### 4. One-Command HashKey Chain Mainnet (`177`) Deployment
+
+Once `~3-5 HSK` lands on `0x57A46E4E5F538452E4D672EF9D48e3e90E10A81C`:
 
 ```bash
-# Safe dry-run verification against live HashKey Chain RPCs (no private key needed)
+# 1. Verify live RPC, bytecode size, and deployer balance (no private key needed)
 npm run deploy:mainnet -- --dry-run
-npm run deploy:testnet -- --dry-run
 
-# Broadcast HorizonGuardVault to HashKey Chain Mainnet (requires ~3-5 HSK gas)
-DEPLOYER_PRIVATE_KEY=0x... AGENT_ADDRESS=0x... npm run deploy:mainnet
-
-# Deploy full MockHSKSwap sandbox to HashKey Chain Testnet (chainId 133)
-DEPLOYER_PRIVATE_KEY=0x... AGENT_ADDRESS=0x... npm run deploy:testnet
+# 2. Deploy HorizonGuardVault, expand pool TWAP cardinality, pin 0.05% oracle,
+#    authorize keeper, sync initial TWAP, and configure distinct session key ($1,000 cap)
+DEPLOYER_PRIVATE_KEY=0x<OWNER_PK> AGENT_ADDRESS=0x<DISTINCT_SESSION_KEY> npm run deploy:mainnet
 ```
 
----
-
-## 2-Minute Demo Script (Seoul Demo Day / Online Presentation)
-
-- **0:00 – 0:25 | The Problem & On-Chain Thesis**: "Autonomous AI trading bots fail in DeFi because off-chain prompts cannot enforce capital safety. When liquidity thins or an LLM hallucinates a bad swap, funds vanish. HorizonQuant fixes this on HashKey Chain with `HorizonGuardVault` — a non-custodial smart contract where the AI holds only a scoped EIP-712 session key, never custody."
-- **0:25 – 0:55 | Live HashKey Mainnet Telemetry & Conversational Control**: Show the live `Command & Risk Terminal` streaming real block height, `500 gwei` gas, and live `WHSK/USDT` spot prices from HSKSwap V3 `0.05%` and `0.30%` pools. Type `"Cap daily loss at 2.5%, allocate 20% into HSK/USDT momentum with 40bps max slippage"` in the Copilot — highlight the immediate policy update and generated `updateRiskPolicy` ABI calldata. Try `"Set max slippage to 800bps"` to demonstrate the hard Solidity `HARD_MAX_SLIPPAGE_BPS` rejection.
-- **0:55 – 1:25 | EIP-712 Execution & HSKSwap Spread Arbitrage**: Switch to `Copilot & EIP-712 Studio`, inspect all 7 pre-flight vault checks and the EIP-712 `TradeIntent` digest with verifiable `signalHash`, click **Sign & Execute Swap**, and show the new `ExecutionRecord[]` row. Switch to `HSKSwap Arbitrage & Backtest` to show live cross-fee-tier spreads and the 30-day Guarded vs Unguarded equity curve proving lower max drawdown and positive Sharpe/Sortino attribution.
-- **1:25 – 2:00 | Circuit Breaker Proof & Mainnet Readiness**: Open `On-Chain Vault & Mainnet Deploy`, trigger **Simulate -3.5% Drawdown Shock** to watch the daily stop-loss circuit breaker latch and block further agent execution, then click **Reset Circuit Breaker**. Highlight `21/21` Foundry unit + fuzz tests (`1,024` runs), verified HSKSwap V3 `SwapRouter` (`0x1f38...dc64`) ABI compatibility, and one-command deployment to HashKey Chain Mainnet (`chainId 177`).
+The script writes deployed addresses and transaction hashes to `deployments/mainnet-177.json` and prints the exact `forge verify-contract` command for `https://hsk.blockscout.com` plus the direct `?vault=<address>` terminal URL.
 
 ---
-
-## Repository Structure
-
-```text
-hsk-horizon/
-├── SPEC.md                       # Verified hackathon rules, live HSK Chain RPC & contract recon
-├── README.md                     # Architecture, verification proof & 2-minute demo script
-├── contracts/                    # Foundry (Solidity 0.8.28)
-│   ├── src/HorizonGuardVault.sol
-│   ├── src/MockHSKSwapRouter.sol
-│   ├── src/MockERC20.sol
-│   ├── test/HorizonGuardVault.t.sol
-│   └── script/DeployHorizonGuard.s.sol
-├── packages/agent/               # TypeScript Autonomous Agent, Copilot & Deploy CLI
-│   ├── src/config/networks.ts
-│   ├── src/rpc/hskTelemetry.ts
-│   ├── src/strategy/signalEngine.ts
-│   ├── src/copilot/commandParser.ts
-│   ├── src/backtest/attributionEngine.ts
-│   ├── src/vault/eip712.ts
-│   ├── src/server/apiServer.ts
-│   ├── scripts/deploy-hsk-mainnet.ts
-│   └── scripts/deploy-hsk-testnet.ts
-├── apps/web/                     # Institutional React + Vite Conversational PnL & Risk Terminal
-└── docs/screenshots/             # 4 Retina 2880x1800 QA screenshots
-```
 
 ## License
 

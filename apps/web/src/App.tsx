@@ -1,43 +1,61 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { BarChart3, Bot, LayoutDashboard, Shield } from "lucide-react";
+import { isAddress, type Address } from "viem";
 import {
   computeVaultNavUsd,
+  evaluateDecisionCycle,
   evaluatePairSignal,
+  fetchLiveVaultState,
   fetchMainnetTelemetry,
   generateDeterministicPriceSeries,
+  getMarketAvailability,
   HASHKEY_MAINNET,
   parseAndExecuteCopilotCommand,
-  runDeterministicBacktest,
+  runGuardrailStressScenario,
   scanArbitrageOpportunities,
+  simulateAdversarialAttack,
   VERIFIED_MAINNET_SNAPSHOT,
+  type AdversarialAttackId,
+  type AdversarialCheckResult,
+  type AgentDecisionEntry,
   type ChainTelemetrySnapshot,
   type QuantSignal,
   type VaultRuntimeState,
 } from "@horizonquant/agent";
 import { TopTelemetryBar } from "./components/TopTelemetryBar";
 import { CommandOverviewView, type ChatMessage } from "./components/CommandOverviewView";
-import { CopilotIntentView, type SimulatedExecutionLog } from "./components/CopilotIntentView";
+import { CopilotIntentView, type ExecutionLogItem } from "./components/CopilotIntentView";
 import { ArbitrageBacktestView } from "./components/ArbitrageBacktestView";
 import { VaultSecurityView } from "./components/VaultSecurityView";
+import {
+  broadcastPolicyUpdateOnChain,
+  broadcastVaultControlOnChain,
+  connectHskWallet,
+  signAndBroadcastGuardedSwap,
+  verifyAdversarialRevertLive,
+} from "./wallet/hskWallet";
 
 type TabId = "overview" | "copilot" | "analytics" | "vault";
 
 const INITIAL_VAULT: VaultRuntimeState = {
-  vaultAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  agentAddress: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+  vaultAddress: HASHKEY_MAINNET.deployedVaultAddress,
+  ownerAddress: HASHKEY_MAINNET.deployerAddress,
+  agentAddress: "0x000000000000000000000000000000000000dEaD",
+  isLiveOnChain: false,
   paused: false,
   circuitBreakerTripped: false,
-  currentDrawdownBps: 42,
-  dailyTradeCount: 6,
-  secondsSinceLastTrade: 410,
-  sessionVolumeUsedUsd: 42_500,
-  sessionVolumeCapUsd: 250_000,
-  nonce: 6,
+  currentDrawdownBps: 0,
+  dailyTradeCount: 0,
+  secondsSinceLastTrade: 600,
+  oracleAgeSec: 45,
+  oracleMaxStalenessSec: 3600,
+  oracleMaxDeviationBps: 1000,
+  sessionVolumeUsedUsd: 0,
+  sessionVolumeCapUsd: 1_000,
+  nonce: 0,
   balances: {
-    USDT: 46_250,
-    WHSK: 237_500,
-    WETH: 2.4,
-    WBTC: 0.08,
+    USDT: 500,
+    WHSK: 5_000,
   },
   policy: {
     maxSlippageBps: 50,
@@ -46,9 +64,9 @@ const INITIAL_VAULT: VaultRuntimeState = {
     minTradeIntervalSec: 300,
     maxDailyTrades: 24,
   },
-  strategyMode: "HYBRID",
+  strategyMode: "ARBITRAGE",
   riskAppetite: "BALANCED",
-  targetPairs: ["WHSK/USDT", "WETH/USDT", "WBTC/USDT"],
+  targetPairs: ["WHSK/USDT"],
 };
 
 const INITIAL_MESSAGES: ChatMessage[] = [
@@ -56,43 +74,7 @@ const INITIAL_MESSAGES: ChatMessage[] = [
     id: "init-1",
     role: "agent",
     text:
-      "HorizonQuant Copilot online on HashKey Chain Mainnet (chainId 177). Connected to HSKSwap V3 SwapRouter (0x1f38...dc64) with hard on-chain guardrails armed: 50 bps slippage cap, 25% max single-trade size, and 3.00% daily drawdown circuit breaker.",
-  },
-];
-
-const INITIAL_EXECUTIONS: SimulatedExecutionLog[] = [
-  {
-    id: 5,
-    timestamp: "14:52:18 UTC",
-    pair: "WHSK/USDT",
-    action: "BUY",
-    notionalUsd: 8400,
-    slippageBps: 9,
-    strategyTag: "HQ_MOMENTUM_WHSK_USDT",
-    signalHash: "0x91e4f8a2b1c409d31e5f7c2a4d8b3091f2a71e5c8a2d49b6c1e80f3a41d2e6a4",
-    intentDigest: "0x4a7b2c91d8e031f5c6a92b4d8e1f0c3a9b7d2e5f8c1a4b6d0e3f9a2c5b8d1e4f",
-  },
-  {
-    id: 4,
-    timestamp: "14:18:04 UTC",
-    pair: "WETH/USDT",
-    action: "BUY",
-    notionalUsd: 6250,
-    slippageBps: 14,
-    strategyTag: "HQ_MEAN_REVERSION_WETH_USDT",
-    signalHash: "0x5c3e1a9d7b4f82e60a1c9d3e5f7b2a4c8d0e1f3a5b7c9d1e3f5a7b9c1d3e5f7a",
-    intentDigest: "0x8d2f4a6c1e9b3d5f7a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f",
-  },
-  {
-    id: 3,
-    timestamp: "13:34:49 UTC",
-    pair: "WHSK/USDT",
-    action: "ARB_ROTATE",
-    notionalUsd: 5100,
-    slippageBps: 6,
-    strategyTag: "HQ_ARBITRAGE_WHSK_USDT",
-    signalHash: "0x2f4e6d8c0b2a496877564534231201ffeeddccbbaa99887766554433221100ab",
-    intentDigest: "0x7c5a3e1f9d7b5a3c1e9f7d5b3a1c9e7f5d3b1a9c7e5f3d1b9a7c5e3f1d9b7a5c",
+      "Deterministic Policy Compiler online for HashKey Chain Mainnet (chainId 177). Streaming live WHSK/USDT 0.05% and 0.30% V3 pools from https://mainnet.hsk.xyz. Connect an EIP-1193 wallet and attach a deployed HorizonGuardVault address to broadcast real on-chain transactions.",
   },
 ];
 
@@ -104,42 +86,23 @@ export default function App() {
   });
   const [telemetry, setTelemetry] = useState<ChainTelemetrySnapshot>(VERIFIED_MAINNET_SNAPSHOT);
   const [refreshing, setRefreshing] = useState(false);
+  const [busyTx, setBusyTx] = useState(false);
+  const [walletAddress, setWalletAddress] = useState<Address | null>(null);
+  const [walletChainId, setWalletChainId] = useState<number | null>(null);
   const [vault, setVault] = useState<VaultRuntimeState>(INITIAL_VAULT);
   const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
-  const [executions, setExecutions] = useState<SimulatedExecutionLog[]>(INITIAL_EXECUTIONS);
+  const [executions, setExecutions] = useState<ExecutionLogItem[]>([]);
+  const [decisions, setDecisions] = useState<AgentDecisionEntry[]>([]);
+  const [adversarialLog, setAdversarialLog] = useState<AdversarialCheckResult[]>([]);
   const [selectedProfile, setSelectedProfile] = useState<"CONSERVATIVE" | "BALANCED" | "AGGRESSIVE">("BALANCED");
 
-  const syncRpc = useCallback(async () => {
-    setRefreshing(true);
-    try {
-      const snap = await fetchMainnetTelemetry();
-      setTelemetry(snap);
-    } finally {
-      setRefreshing(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void syncRpc();
-  }, [syncRpc]);
-
-  const handleSelectTab = (tab: TabId) => {
-    setActiveTab(tab);
-    window.history.replaceState(null, "", `#${tab}`);
-  };
-
   const navUsd = useMemo(() => computeVaultNavUsd(vault, telemetry), [vault, telemetry]);
+  const markets = useMemo(() => getMarketAvailability(telemetry), [telemetry]);
 
-  const signals = useMemo(() => {
+  const primarySignal = useMemo(() => {
     const whskSeries = generateDeterministicPriceSeries(telemetry.whskUsdtSpot, 36, 8.2);
-    const wethSeries = generateDeterministicPriceSeries(HASHKEY_MAINNET.tokens.WETH.referenceUsd, 36, 4.4);
-    const wbtcSeries = generateDeterministicPriceSeries(HASHKEY_MAINNET.tokens.WBTC.referenceUsd, 36, -1.2);
     const fixedNow = Math.floor(Date.now() / 1000);
-    return [
-      evaluatePairSignal("WHSK/USDT", whskSeries, vault, telemetry, fixedNow),
-      evaluatePairSignal("WETH/USDT", wethSeries, vault, telemetry, fixedNow),
-      evaluatePairSignal("WBTC/USDT", wbtcSeries, vault, telemetry, fixedNow),
-    ];
+    return evaluatePairSignal("WHSK/USDT", whskSeries, vault, telemetry, fixedNow);
   }, [telemetry, vault]);
 
   const arbitrage = useMemo(
@@ -148,9 +111,135 @@ export default function App() {
   );
 
   const backtest = useMemo(
-    () => runDeterministicBacktest(navUsd, vault.policy, selectedProfile, telemetry.whskUsdtSpot),
+    () => runGuardrailStressScenario(Math.max(100, navUsd), vault.policy, selectedProfile, telemetry.whskUsdtSpot),
     [navUsd, vault.policy, selectedProfile, telemetry.whskUsdtSpot],
   );
+
+  const loadDeployedVault = useCallback(async (rawAddress: string) => {
+    if (!isAddress(rawAddress)) {
+      setMessages((prev) => [
+        ...prev,
+        { id: `err-${Date.now()}`, role: "agent", text: `Invalid vault address: ${rawAddress}` },
+      ]);
+      return;
+    }
+    setBusyTx(true);
+    try {
+      const live = await fetchLiveVaultState(rawAddress as Address);
+      const nowSec = Math.floor(Date.now() / 1000);
+      setVault((prev) => ({
+        ...prev,
+        vaultAddress: live.vaultAddress,
+        ownerAddress: live.owner,
+        agentAddress: live.agent,
+        isLiveOnChain: true,
+        paused: live.paused,
+        circuitBreakerTripped: live.circuitBreakerTripped,
+        currentDrawdownBps: live.currentDrawdownBps,
+        dailyTradeCount: live.dailyTradeCount,
+        secondsSinceLastTrade: live.lastTradeTimestamp > 0 ? Math.max(0, nowSec - live.lastTradeTimestamp) : 9999,
+        oracleAgeSec: live.whskLastPriceUpdatedAt > 0 ? Math.max(0, nowSec - live.whskLastPriceUpdatedAt) : 9999,
+        oracleMaxStalenessSec: live.oracleMaxStalenessSec || 3600,
+        oracleMaxDeviationBps: live.oracleMaxDeviationBps || 1000,
+        sessionVolumeUsedUsd: Number(live.sessionVolumeUsedUsd.toFixed(2)),
+        sessionVolumeCapUsd: Number(live.sessionVolumeCapUsd.toFixed(2)),
+        nonce: live.nonce,
+        balances: {
+          USDT: Number(live.usdtBalance.toFixed(4)),
+          WHSK: Number(live.whskBalance.toFixed(4)),
+        },
+        policy: live.policy,
+      }));
+      setExecutions(
+        live.executions.map((ex) => ({
+          id: ex.id,
+          timestamp: new Date(ex.timestamp * 1000).toISOString().slice(11, 19) + " UTC",
+          pair: "WHSK/USDT",
+          action: ex.tokenIn.toLowerCase() === HASHKEY_MAINNET.tokens.USDT.address.toLowerCase() ? "BUY" : "SELL",
+          notionalUsd: Number(ex.postTradeNavE18) > 0 ? Number((Number(ex.amountIn) / 1e6).toFixed(4)) : 0,
+          slippageBps: ex.realizedSlippageBps,
+          strategyTag: ex.strategyTag,
+          signalHash: ex.signalHash,
+          intentDigest: ex.signalHash,
+          mode: "ON_CHAIN_TX",
+        })),
+      );
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `vault-${Date.now()}`,
+          role: "agent",
+          text: `Attached live HorizonGuardVault ${live.vaultAddress} on chainId 177. Owner ${live.owner.slice(0, 10)}..., Agent ${live.agent.slice(0, 10)}..., NAV $${live.totalNavUsd.toFixed(2)}, ${live.executions.length} on-chain execution records.`,
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `verr-${Date.now()}`,
+          role: "agent",
+          text: `Failed reading HorizonGuardVault at ${rawAddress}: ${err instanceof Error ? err.message : String(err)}`,
+        },
+      ]);
+    } finally {
+      setBusyTx(false);
+    }
+  }, []);
+
+  const syncRpc = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const snap = await fetchMainnetTelemetry();
+      setTelemetry(snap);
+      const whskSeries = generateDeterministicPriceSeries(snap.whskUsdtSpot, 36, 8.2);
+      const sig = evaluatePairSignal("WHSK/USDT", whskSeries, vault, snap, Math.floor(Date.now() / 1000));
+      const dec = evaluateDecisionCycle(snap, vault, sig);
+      setDecisions((prev) => [dec, ...prev].slice(0, 20));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [vault]);
+
+  useEffect(() => {
+    void syncRpc();
+    const params = new URLSearchParams(window.location.search);
+    const paramVault = params.get("vault");
+    if (paramVault && isAddress(paramVault)) {
+      void loadDeployedVault(paramVault);
+    }
+    // Initial boot sync only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleSelectTab = (tab: TabId) => {
+    setActiveTab(tab);
+    window.history.replaceState(null, "", `#${tab}`);
+  };
+
+  const handleConnectWallet = useCallback(async () => {
+    try {
+      const res = await connectHskWallet();
+      setWalletAddress(res.address);
+      setWalletChainId(res.chainId);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `wallet-${Date.now()}`,
+          role: "agent",
+          text: `Wallet connected: ${res.address} on chainId ${res.chainId}${res.switchedToHsk ? " (HashKey Chain Mainnet verified)." : " — switch network to HashKey Chain Mainnet (177) before broadcasting."}`,
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `werr-${Date.now()}`,
+          role: "agent",
+          text: err instanceof Error ? err.message : String(err),
+        },
+      ]);
+    }
+  }, []);
 
   const handleSendCommand = useCallback(
     (cmd: string) => {
@@ -199,32 +288,101 @@ export default function App() {
     [telemetry, vault],
   );
 
-  const handleExecuteSignal = useCallback(
-    (signal: QuantSignal) => {
-      if (!signal.intent || !signal.allGuardsPassed) return;
-      const notional = signal.recommendedSizeUsd;
-      const realizedSlip = Math.min(vault.policy.maxSlippageBps - 5, 11);
+  const handleBroadcastPolicy = useCallback(async () => {
+    if (!walletAddress || !vault.vaultAddress || !vault.isLiveOnChain) return;
+    setBusyTx(true);
+    try {
+      const res = await broadcastPolicyUpdateOnChain(vault.vaultAddress, walletAddress, vault.policy);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `tx-${Date.now()}`,
+          role: "agent",
+          text: `Broadcast updateRiskPolicy on HashKey Chain Mainnet (177). Confirmed tx ready on Blockscout.`,
+          txHash: res.txHash,
+        },
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `txerr-${Date.now()}`,
+          role: "agent",
+          text: `Policy transaction reverted/rejected: ${err instanceof Error ? err.message : String(err)}`,
+        },
+      ]);
+    } finally {
+      setBusyTx(false);
+    }
+  }, [vault.isLiveOnChain, vault.policy, vault.vaultAddress, walletAddress]);
 
+  const handleExecuteSignal = useCallback(
+    async (signal: QuantSignal) => {
+      if (!signal.intent || !signal.allGuardsPassed) return;
+
+      // Path A: Real wallet + live deployed vault -> real EIP-712 signature + mainnet tx
+      if (walletAddress && vault.vaultAddress && vault.isLiveOnChain) {
+        setBusyTx(true);
+        try {
+          const res = await signAndBroadcastGuardedSwap(vault.vaultAddress, walletAddress, signal.intent);
+          setExecutions((prev) => [
+            {
+              id: vault.nonce,
+              timestamp: new Date().toISOString().slice(11, 19) + " UTC",
+              pair: signal.pair,
+              action: signal.action,
+              notionalUsd: signal.recommendedSizeUsd,
+              slippageBps: 0,
+              strategyTag: `HQ_${signal.strategyMode}_WHSK_USDT`,
+              signalHash: signal.intent!.signalHash,
+              intentDigest: signal.intentDigest ?? "0x0",
+              mode: "ON_CHAIN_TX",
+              txHash: res.txHash,
+            },
+            ...prev,
+          ]);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `exec-tx-${Date.now()}`,
+              role: "agent",
+              text: `Signed EIP-712 TradeIntent and broadcast executeGuardedSwap on HSK Chain Mainnet (177).`,
+              txHash: res.txHash,
+            },
+          ]);
+          await loadDeployedVault(vault.vaultAddress);
+        } catch (err) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `exec-err-${Date.now()}`,
+              role: "agent",
+              text: `On-chain executeGuardedSwap reverted or rejected by wallet: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ]);
+        } finally {
+          setBusyTx(false);
+        }
+        return;
+      }
+
+      // Path B: Honest local paper fill (never pretends an on-chain tx was mined)
+      const notional = signal.recommendedSizeUsd;
+      const simulatedSlip = Math.min(vault.policy.maxSlippageBps, 8);
       setVault((prev) => {
         const nextBalances = { ...prev.balances };
-        if (signal.pair === "WHSK/USDT") {
-          if (signal.action === "BUY" || signal.action === "ARB_ROTATE") {
-            nextBalances.USDT = Math.max(0, Number((nextBalances.USDT - notional).toFixed(2)));
-            nextBalances.WHSK = Number((nextBalances.WHSK + notional / signal.spotPrice).toFixed(2));
-          } else {
-            nextBalances.USDT = Number((nextBalances.USDT + notional).toFixed(2));
-            nextBalances.WHSK = Math.max(0, Number((nextBalances.WHSK - notional / signal.spotPrice).toFixed(2)));
-          }
-        } else if (signal.pair === "WETH/USDT") {
-          nextBalances.USDT = Math.max(0, Number((nextBalances.USDT - notional).toFixed(2)));
-          nextBalances.WETH = Number((nextBalances.WETH + notional / signal.spotPrice).toFixed(4));
+        if (signal.action === "BUY" || signal.action === "ARB_ROTATE") {
+          nextBalances.USDT = Math.max(0, Number((nextBalances.USDT - notional).toFixed(4)));
+          nextBalances.WHSK = Number((nextBalances.WHSK + notional / signal.twapPrice).toFixed(4));
+        } else {
+          nextBalances.USDT = Number((nextBalances.USDT + notional).toFixed(4));
+          nextBalances.WHSK = Math.max(0, Number((nextBalances.WHSK - notional / signal.twapPrice).toFixed(4)));
         }
-
         return {
           ...prev,
           nonce: prev.nonce + 1,
           dailyTradeCount: prev.dailyTradeCount + 1,
-          sessionVolumeUsedUsd: Number((prev.sessionVolumeUsedUsd + notional).toFixed(2)),
+          sessionVolumeUsedUsd: Number((prev.sessionVolumeUsedUsd + notional).toFixed(4)),
           balances: nextBalances,
         };
       });
@@ -236,10 +394,11 @@ export default function App() {
           pair: signal.pair,
           action: signal.action,
           notionalUsd: notional,
-          slippageBps: realizedSlip,
-          strategyTag: `HQ_${signal.strategyMode}_${signal.pair.replace("/", "_")}`,
+          slippageBps: simulatedSlip,
+          strategyTag: `HQ_${signal.strategyMode}_WHSK_USDT`,
           signalHash: signal.intent!.signalHash,
           intentDigest: signal.intentDigest ?? "0x0",
+          mode: "PAPER_FILL",
         },
         ...prev,
       ]);
@@ -247,18 +406,82 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         {
-          id: `exec-${Date.now()}`,
+          id: `paper-${Date.now()}`,
           role: "agent",
-          text: `Executed guarded EIP-712 swap #${vault.nonce} on HSKSwap V3 (${signal.pair} ${signal.action} $${notional.toLocaleString()}) · Realized slippage ${realizedSlip} bps (cap ${vault.policy.maxSlippageBps} bps) · Zero residual router allowance confirmed.`,
+          text: `[PAPER FILL — NO ON-CHAIN TX SENT] Simulated ${signal.pair} ${signal.action} $${notional.toFixed(4)} inside 2% pool depth cap. Connect an EIP-1193 wallet + deployed vault address to sign and broadcast live on chainId 177.`,
         },
       ]);
     },
-    [vault.nonce, vault.policy.maxSlippageBps],
+    [loadDeployedVault, vault.isLiveOnChain, vault.nonce, vault.policy.maxSlippageBps, vault.vaultAddress, walletAddress],
+  );
+
+  const handleRunAdversarial = useCallback(
+    async (attackId: AdversarialAttackId) => {
+      const parityResult = simulateAdversarialAttack(attackId, vault, telemetry);
+      if (vault.vaultAddress && vault.isLiveOnChain) {
+        setBusyTx(true);
+        try {
+          const liveResult = await verifyAdversarialRevertLive(vault.vaultAddress, parityResult);
+          setAdversarialLog((prev) => [liveResult, ...prev].slice(0, 10));
+        } finally {
+          setBusyTx(false);
+        }
+      } else {
+        setAdversarialLog((prev) => [parityResult, ...prev].slice(0, 10));
+      }
+    },
+    [telemetry, vault],
+  );
+
+  const handleVaultControl = useCallback(
+    async (action: "PAUSE" | "UNPAUSE" | "RESET_CB" | "SYNC_TWAP") => {
+      if (walletAddress && vault.vaultAddress && vault.isLiveOnChain) {
+        setBusyTx(true);
+        try {
+          const res = await broadcastVaultControlOnChain(vault.vaultAddress, walletAddress, action);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `ctl-${Date.now()}`,
+              role: "agent",
+              text: `Broadcast ${action} to HorizonGuardVault on HashKey Chain Mainnet (177).`,
+              txHash: res.txHash,
+            },
+          ]);
+          await loadDeployedVault(vault.vaultAddress);
+        } catch (err) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `ctlerr-${Date.now()}`,
+              role: "agent",
+              text: `Control tx failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ]);
+        } finally {
+          setBusyTx(false);
+        }
+        return;
+      }
+
+      if (action === "PAUSE") handleSendCommand("Emergency pause vault");
+      else if (action === "UNPAUSE") handleSendCommand("Resume trading and unpause vault");
+      else if (action === "RESET_CB") handleSendCommand("Reset circuit breaker and resume trading");
+    },
+    [handleSendCommand, loadDeployedVault, vault.isLiveOnChain, vault.vaultAddress, walletAddress],
   );
 
   return (
     <div className="app-shell">
-      <TopTelemetryBar telemetry={telemetry} vault={vault} refreshing={refreshing} onRefresh={syncRpc} />
+      <TopTelemetryBar
+        telemetry={telemetry}
+        vault={vault}
+        walletAddress={walletAddress}
+        walletChainId={walletChainId}
+        refreshing={refreshing}
+        onRefresh={syncRpc}
+        onConnectWallet={handleConnectWallet}
+      />
 
       <nav className="nav-bar">
         <div className="nav-tabs">
@@ -268,7 +491,7 @@ export default function App() {
             onClick={() => handleSelectTab("overview")}
           >
             <LayoutDashboard size={14} />
-            Command &amp; Risk Terminal
+            Decision Ledger &amp; Terminal
           </button>
           <button
             type="button"
@@ -276,7 +499,7 @@ export default function App() {
             onClick={() => handleSelectTab("copilot")}
           >
             <Bot size={14} />
-            Copilot &amp; EIP-712 Studio
+            Policy Compiler &amp; EIP-712
           </button>
           <button
             type="button"
@@ -284,7 +507,7 @@ export default function App() {
             onClick={() => handleSelectTab("analytics")}
           >
             <BarChart3 size={14} />
-            HSKSwap Arbitrage &amp; Backtest
+            Live Pools &amp; Stress Scenario
           </button>
           <button
             type="button"
@@ -292,14 +515,14 @@ export default function App() {
             onClick={() => handleSelectTab("vault")}
           >
             <Shield size={14} />
-            On-Chain Vault &amp; Mainnet Deploy
+            Adversarial Breaker Lab &amp; Deploy
           </button>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 11.5, color: "#94a3b8" }}>
           <span>Router:</span>
-          <span className="mono text-cyan">0x1f38...dc64 (HSKSwap V3)</span>
-          <span className="badge badge-emerald">Non-Custodial</span>
+          <span className="mono text-cyan">0x1f38...dc64</span>
+          <span className="badge badge-emerald">TWAP + Oracle Floor</span>
         </div>
       </nav>
 
@@ -309,19 +532,28 @@ export default function App() {
             telemetry={telemetry}
             vault={vault}
             navUsd={navUsd}
-            signals={signals}
-            backtest={backtest}
+            primarySignal={primarySignal}
+            markets={markets}
+            liveArb={arbitrage[0]}
+            decisions={decisions}
             messages={messages}
+            walletAddress={walletAddress}
+            busyTx={busyTx}
             onSendCommand={handleSendCommand}
             onExecuteSignal={handleExecuteSignal}
+            onBroadcastPolicy={handleBroadcastPolicy}
+            onScanNow={syncRpc}
+            onJumpToBreakerLab={() => handleSelectTab("vault")}
           />
         )}
         {activeTab === "copilot" && (
           <CopilotIntentView
             vault={vault}
-            signals={signals}
+            primarySignal={primarySignal}
             messages={messages}
             executions={executions}
+            walletAddress={walletAddress}
+            busyTx={busyTx}
             onSendCommand={handleSendCommand}
             onExecuteSignal={handleExecuteSignal}
           />
@@ -338,11 +570,15 @@ export default function App() {
         {activeTab === "vault" && (
           <VaultSecurityView
             vault={vault}
+            walletAddress={walletAddress}
+            adversarialLog={adversarialLog}
+            busyTx={busyTx}
+            onRunAdversarialTest={handleRunAdversarial}
+            onLoadVaultAddress={loadDeployedVault}
             onSimulateCrash={() => handleSendCommand("Simulate 3.5% drawdown crash to test circuit breaker")}
-            onResetCircuitBreaker={() => handleSendCommand("Reset circuit breaker and resume trading")}
-            onTogglePause={() =>
-              handleSendCommand(vault.paused ? "Resume trading and unpause vault" : "Emergency pause vault")
-            }
+            onResetCircuitBreaker={() => handleVaultControl("RESET_CB")}
+            onTogglePause={() => handleVaultControl(vault.paused ? "UNPAUSE" : "PAUSE")}
+            onSyncTwapOnChain={() => handleVaultControl("SYNC_TWAP")}
           />
         )}
       </main>

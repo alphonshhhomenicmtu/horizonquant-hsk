@@ -2,33 +2,40 @@ import http from "node:http";
 import { HASHKEY_MAINNET } from "../config/networks.js";
 import { fetchMainnetTelemetry, type ChainTelemetrySnapshot } from "../rpc/hskTelemetry.js";
 import {
+  evaluateDecisionCycle,
   evaluatePairSignal,
   generateDeterministicPriceSeries,
+  getMarketAvailability,
   scanArbitrageOpportunities,
+  simulateAdversarialAttack,
+  type AdversarialAttackId,
   type VaultRuntimeState,
 } from "../strategy/signalEngine.js";
 import { computeVaultNavUsd, parseAndExecuteCopilotCommand } from "../copilot/commandParser.js";
-import { runDeterministicBacktest } from "../backtest/attributionEngine.js";
+import { runGuardrailStressScenario } from "../backtest/attributionEngine.js";
 import { serializeIntentForDisplay } from "../vault/eip712.js";
 
 const PORT = Number(process.env.HORIZON_API_PORT ?? 8787);
 
 const runtimeVault: VaultRuntimeState = {
-  vaultAddress: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  agentAddress: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+  vaultAddress: HASHKEY_MAINNET.deployedVaultAddress,
+  ownerAddress: HASHKEY_MAINNET.deployerAddress,
+  agentAddress: "0x000000000000000000000000000000000000dEaD",
+  isLiveOnChain: false,
   paused: false,
   circuitBreakerTripped: false,
-  currentDrawdownBps: 42,
-  dailyTradeCount: 6,
-  secondsSinceLastTrade: 410,
-  sessionVolumeUsedUsd: 42_500,
-  sessionVolumeCapUsd: 250_000,
-  nonce: 6,
+  currentDrawdownBps: 0,
+  dailyTradeCount: 0,
+  secondsSinceLastTrade: 600,
+  oracleAgeSec: 45,
+  oracleMaxStalenessSec: 3600,
+  oracleMaxDeviationBps: 1000,
+  sessionVolumeUsedUsd: 0,
+  sessionVolumeCapUsd: 1_000,
+  nonce: 0,
   balances: {
-    USDT: 46_250,
-    WHSK: 237_500,
-    WETH: 2.4,
-    WBTC: 0.08,
+    USDT: 500,
+    WHSK: 5_000,
   },
   policy: {
     maxSlippageBps: 50,
@@ -37,9 +44,9 @@ const runtimeVault: VaultRuntimeState = {
     minTradeIntervalSec: 300,
     maxDailyTrades: 24,
   },
-  strategyMode: "HYBRID",
+  strategyMode: "ARBITRAGE",
   riskAppetite: "BALANCED",
-  targetPairs: ["WHSK/USDT", "WETH/USDT", "WBTC/USDT"],
+  targetPairs: ["WHSK/USDT"],
 };
 
 let cachedTelemetry: ChainTelemetrySnapshot | null = null;
@@ -105,18 +112,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/state" && req.method === "GET") {
       const telemetry = await getTelemetry();
       const whskSeries = generateDeterministicPriceSeries(telemetry.whskUsdtSpot, 36, 7.2);
-      const wethSeries = generateDeterministicPriceSeries(HASHKEY_MAINNET.tokens.WETH.referenceUsd, 36, 3.1);
-      const wbtcSeries = generateDeterministicPriceSeries(HASHKEY_MAINNET.tokens.WBTC.referenceUsd, 36, 1.8);
-
-      const signals = [
-        evaluatePairSignal("WHSK/USDT", whskSeries, runtimeVault, telemetry),
-        evaluatePairSignal("WETH/USDT", wethSeries, runtimeVault, telemetry),
-        evaluatePairSignal("WBTC/USDT", wbtcSeries, runtimeVault, telemetry),
-      ].map((s) => ({
-        ...s,
-        intentDisplay: s.intent ? serializeIntentForDisplay(s.intent) : null,
-      }));
-
+      const primarySignal = evaluatePairSignal("WHSK/USDT", whskSeries, runtimeVault, telemetry);
+      const decision = evaluateDecisionCycle(telemetry, runtimeVault, primarySignal);
       const arbitrage = scanArbitrageOpportunities(
         telemetry,
         runtimeVault.balances.USDT,
@@ -127,9 +124,23 @@ const server = http.createServer(async (req, res) => {
         telemetry,
         vault: runtimeVault,
         navUsd: computeVaultNavUsd(runtimeVault, telemetry),
-        signals,
+        markets: getMarketAvailability(telemetry),
+        signals: [
+          {
+            ...primarySignal,
+            intentDisplay: primarySignal.intent ? serializeIntentForDisplay(primarySignal.intent) : null,
+          },
+        ],
+        decision,
         arbitrage,
       });
+      return;
+    }
+
+    if (url.pathname === "/api/adversarial" && req.method === "GET") {
+      const attack = (url.searchParams.get("attack") ?? "ONE_WEI_SLIPPAGE") as AdversarialAttackId;
+      const telemetry = await getTelemetry();
+      sendJson(res, 200, simulateAdversarialAttack(attack, runtimeVault, telemetry));
       return;
     }
 
@@ -139,7 +150,7 @@ const server = http.createServer(async (req, res) => {
         profileParam === "CONSERVATIVE" || profileParam === "AGGRESSIVE" ? profileParam : "BALANCED";
       const telemetry = await getTelemetry();
       const navUsd = computeVaultNavUsd(runtimeVault, telemetry);
-      const report = runDeterministicBacktest(navUsd, runtimeVault.policy, profile, telemetry.whskUsdtSpot);
+      const report = runGuardrailStressScenario(navUsd, runtimeVault.policy, profile, telemetry.whskUsdtSpot);
       sendJson(res, 200, report);
       return;
     }

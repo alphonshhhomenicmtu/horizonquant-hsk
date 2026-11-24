@@ -26,6 +26,16 @@ interface Vm {
 abstract contract TestBase {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
+    address[] private _targetedContracts;
+
+    function targetContract(address newTargetContract) internal {
+        _targetedContracts.push(newTargetContract);
+    }
+
+    function targetContracts() public view returns (address[] memory) {
+        return _targetedContracts;
+    }
+
     function assertTrue(bool condition, string memory message) internal pure {
         require(condition, message);
     }
@@ -52,6 +62,10 @@ abstract contract TestBase {
 
     function assertGe(uint256 a, uint256 b, string memory message) internal pure {
         require(a >= b, message);
+    }
+
+    function assertLt(uint256 a, uint256 b, string memory message) internal pure {
+        require(a < b, message);
     }
 
     function assertLe(uint256 a, uint256 b, string memory message) internal pure {

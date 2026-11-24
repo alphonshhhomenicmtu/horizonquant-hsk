@@ -104,6 +104,26 @@ export function encodeResetCircuitBreakerCalldata(): Hex {
   });
 }
 
+export function encodeSyncPriceCalldata(token: Address): Hex {
+  return encodeFunctionData({
+    abi: HORIZON_GUARD_VAULT_ABI,
+    functionName: "syncPriceFromV3Pool",
+    args: [token],
+  });
+}
+
+export function encodeExecuteGuardedSwapCalldata(intent: TradeIntentPayload, signature: Hex): Hex {
+  return encodeFunctionData({
+    abi: HORIZON_GUARD_VAULT_ABI,
+    functionName: "executeGuardedSwap",
+    args: [intent, signature],
+  });
+}
+
+export function computeErrorSelector(signature: string): Hex {
+  return (`0x${keccak256(stringToHex(signature)).slice(2, 10)}`) as Hex;
+}
+
 export function serializeIntentForDisplay(intent: TradeIntentPayload): Record<string, string | number> {
   return {
     router: intent.router,

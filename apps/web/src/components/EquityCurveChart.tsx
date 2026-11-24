@@ -17,9 +17,11 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
   const allValues = points.flatMap((p) => [p.guardedNavUsd, p.unguardedNavUsd, p.benchmarkNavUsd]);
   const rawMin = Math.min(...allValues);
   const rawMax = Math.max(...allValues);
-  const margin = Math.max(500, (rawMax - rawMin) * 0.14);
-  const minY = Math.floor((rawMin - margin) / 500) * 500;
-  const maxY = Math.ceil((rawMax + margin) / 500) * 500;
+  const span = Math.max(20, rawMax - rawMin);
+  const margin = span * 0.15;
+  const step = span > 2000 ? 500 : span > 200 ? 50 : 10;
+  const minY = Math.floor((rawMin - margin) / step) * step;
+  const maxY = Math.ceil((rawMax + margin) / step) * step;
 
   const xOf = (idx: number) => padLeft + (idx / Math.max(1, points.length - 1)) * plotW;
   const yOf = (val: number) => padTop + (1 - (val - minY) / Math.max(1, maxY - minY)) * plotH;
@@ -37,6 +39,8 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
   const xTickIndices = [0, 5, 10, 15, 20, 25, points.length - 1];
   const cbPoints = points.filter((p) => p.circuitBreakerTriggered);
 
+  const formatTick = (v: number) => (v >= 10_000 ? `$${(v / 1000).toFixed(1)}k` : `$${v.toFixed(0)}`);
+
   return (
     <div style={{ width: "100%" }}>
       <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
@@ -47,7 +51,6 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
           </linearGradient>
         </defs>
 
-        {/* Horizontal grid & Y labels */}
         {yTicks.map((tick, idx) => {
           const y = yOf(tick);
           return (
@@ -61,13 +64,12 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
                 fontSize="10.5"
                 fontFamily="JetBrains Mono, monospace"
               >
-                ${(tick / 1000).toFixed(1)}k
+                {formatTick(tick)}
               </text>
             </g>
           );
         })}
 
-        {/* X axis ticks */}
         {xTickIndices.map((idx) => (
           <text
             key={idx}
@@ -82,17 +84,11 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
           </text>
         ))}
 
-        {/* Benchmark line */}
         <path d={benchmarkPath} fill="none" stroke="#64748b" strokeWidth="1.4" strokeDasharray="3 4" />
-
-        {/* Unguarded bot line */}
         <path d={unguardedPath} fill="none" stroke="#f43f5e" strokeWidth="1.7" strokeDasharray="5 4" opacity="0.88" />
-
-        {/* Guarded Vault area + line */}
         <path d={areaPath} fill="url(#guardedFill)" />
         <path d={guardedPath} fill="none" stroke="#10b981" strokeWidth="2.4" />
 
-        {/* Circuit breaker event callouts */}
         {cbPoints.map((pt) => {
           const cx = xOf(pt.day);
           const cy = yOf(pt.guardedNavUsd);
@@ -104,7 +100,6 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
           );
         })}
 
-        {/* Final value marker */}
         {points.length > 0 && (
           <circle
             cx={xOf(points.length - 1)}
@@ -132,11 +127,11 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
         <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span style={{ width: 12, height: 3, background: "#10b981", display: "inline-block" }} />
-            HorizonGuard Vault NAV
+            HorizonGuard Vault (Scenario)
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span style={{ width: 12, height: 2, borderTop: "2px dashed #f43f5e", display: "inline-block" }} />
-            Unguarded AI Bot (No Stop-Loss)
+            Unguarded Bot (No Caps)
           </span>
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <span style={{ width: 12, height: 2, borderTop: "2px dotted #64748b", display: "inline-block" }} />
@@ -145,7 +140,7 @@ export function EquityCurveChart({ points }: EquityCurveChartProps) {
         </div>
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "#fbbf24" }}>
           <span style={{ width: 8, height: 8, borderRadius: 99, background: "#f59e0b", display: "inline-block" }} />
-          On-Chain Circuit Breaker Protection Event
+          Circuit Breaker Shock Cap
         </span>
       </div>
     </div>

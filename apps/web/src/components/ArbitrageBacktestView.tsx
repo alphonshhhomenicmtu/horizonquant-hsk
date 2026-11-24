@@ -1,10 +1,11 @@
-import { BarChart3, ExternalLink, Radar, ShieldCheck } from "lucide-react";
+import { AlertCircle, BarChart3, ExternalLink, Radar, ShieldCheck } from "lucide-react";
 import {
   HASHKEY_MAINNET,
   type ArbitrageOpportunity,
   type BacktestReport,
   type ChainTelemetrySnapshot,
 } from "@horizonquant/agent";
+import { EquityCurveChart } from "./EquityCurveChart";
 
 interface ArbitrageBacktestViewProps {
   telemetry: ChainTelemetrySnapshot;
@@ -23,19 +24,19 @@ export function ArbitrageBacktestView({
 }: ArbitrageBacktestViewProps) {
   return (
     <div className="stack">
-      {/* Live HSKSwap V3 Pool & Arbitrage Radar */}
+      {/* Live HSKSwap V3 Pool & Spread Radar (Verified Pools Only) */}
       <div className="card">
         <div className="card-header">
           <div>
             <div className="card-title">
               <Radar size={15} className="text-cyan" />
-              Live HSKSwap V3 Spread &amp; Arbitrage Scanner (Chain ID {telemetry.chainId})
+              Live HSKSwap V3 Spread &amp; TWAP Monitor (Chain ID {telemetry.chainId})
             </div>
             <div className="card-subtitle">
-              Real-time slot0() &amp; liquidity() reads from verified HashKey Chain Mainnet pools · {telemetry.spreadDirection}
+              Real-time slot0(), liquidity(), observe([300, 0]) &amp; Factory.getPool() reads from HashKey Chain Mainnet · {telemetry.spreadDirection}
             </div>
           </div>
-          <span className="badge badge-cyan">Live Spread: {telemetry.crossTierSpreadBps.toFixed(1)} bps</span>
+          <span className="badge badge-amber">Live Spread: {telemetry.crossTierSpreadBps.toFixed(1)} bps</span>
         </div>
 
         <div className="equal-split" style={{ marginBottom: 14 }}>
@@ -58,28 +59,39 @@ export function ArbitrageBacktestView({
               </div>
               <div className="kv-grid">
                 <div>
-                  <div className="kv-label">Spot Price (USDT)</div>
-                  <div className="kv-val mono text-emerald">${pool.spotPriceUsdt.toFixed(6)}</div>
+                  <div className="kv-label">Spot / 5m TWAP</div>
+                  <div className="kv-val mono text-emerald">
+                    ${pool.spotPriceUsdt.toFixed(6)} / ${pool.twapPriceUsdt.toFixed(6)}
+                  </div>
                 </div>
                 <div>
                   <div className="kv-label">Active Liquidity (L)</div>
                   <div className="kv-val mono">{Number(pool.liquidity).toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="kv-label">Spot vs TWAP Δ</div>
+                  <div className="kv-val mono text-cyan">{pool.spotVsTwapDiffBps.toFixed(2)} bps</div>
+                </div>
+                <div>
+                  <div className="kv-label">Obs Cardinality / Tick</div>
+                  <div className="kv-val mono">
+                    {pool.observationCardinality} · {pool.tick}
+                  </div>
                 </div>
               </div>
             </div>
           ))}
         </div>
 
-        <table className="data-table">
+        <table className="data-table" style={{ marginBottom: 14 }}>
           <thead>
             <tr>
-              <th>Arbitrage / Spread Route</th>
+              <th>Verified Live Spread Route</th>
               <th>Gross Spread</th>
               <th>DEX Fees</th>
               <th>Gas Impact</th>
               <th>Net Edge</th>
-              <th>Target Size</th>
-              <th>Status</th>
+              <th>Agent Verdict</th>
             </tr>
           </thead>
           <tbody>
@@ -87,9 +99,7 @@ export function ArbitrageBacktestView({
               <tr key={opp.id}>
                 <td>
                   <strong>{opp.route}</strong>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    {opp.buyVenue} -&gt; {opp.sellVenue}
-                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{opp.holdReason}</div>
                 </td>
                 <td className="mono">{opp.grossSpreadBps.toFixed(1)} bps</td>
                 <td className="mono text-muted">{opp.poolFeesBps.toFixed(1)} bps</td>
@@ -98,29 +108,44 @@ export function ArbitrageBacktestView({
                   {opp.netEdgeBps > 0 ? "+" : ""}
                   {opp.netEdgeBps.toFixed(2)} bps
                 </td>
-                <td className="mono">${opp.recommendedNotionalUsd.toLocaleString()}</td>
                 <td>
-                  <span className={`badge ${opp.executable ? "badge-emerald" : "badge-slate"}`}>
-                    {opp.executable ? "EXECUTABLE" : "MONITORING"}
+                  <span className={`badge ${opp.executable ? "badge-emerald" : "badge-amber"}`}>
+                    {opp.executable ? "EXECUTABLE" : "HOLD (< FEE HURDLE)"}
                   </span>
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+
+        {/* Live Factory.getPool() Verification Table */}
+        <div className="kv-item" style={{ padding: "10px 12px" }}>
+          <div style={{ fontSize: 11.5, fontWeight: 600, marginBottom: 8, color: "var(--text-primary)" }}>
+            Live HSKSwap V3 Factory.getPool() Audit ({HASHKEY_MAINNET.hskSwapFactory})
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {telemetry.factoryPoolChecks.map((chk) => (
+              <span
+                key={`${chk.pair}-${chk.feeLabel}`}
+                className={`badge ${chk.exists ? "badge-emerald" : "badge-slate"} mono`}
+              >
+                {chk.pair} ({chk.feeLabel}): {chk.exists ? `${chk.poolAddress.slice(0, 8)}...` : "address(0) — NO POOL"}
+              </span>
+            ))}
+          </div>
+        </div>
       </div>
 
-      {/* Deterministic Backtest & Per-Strategy PnL Attribution */}
+      {/* Honest Guardrail Stress Scenario Model */}
       <div className="card">
         <div className="card-header">
           <div>
             <div className="card-title">
               <BarChart3 size={15} className="text-emerald" />
-              30-Day Deterministic Backtest &amp; Per-Strategy PnL Attribution
+              30-Day Tail-Risk Stress Scenario — Guarded Vault vs Unguarded Bot
+              <span className="badge badge-amber">Illustrative Scenario · Not a Historical Backtest</span>
             </div>
-            <div className="card-subtitle">
-              Comparing HorizonGuardVault-enforced execution against an unprotected autonomous trading bot
-            </div>
+            <div className="card-subtitle">{backtest.disclaimer}</div>
           </div>
 
           <div className="segmented">
@@ -137,15 +162,20 @@ export function ArbitrageBacktestView({
           </div>
         </div>
 
+        <div style={{ marginBottom: 14 }}>
+          <EquityCurveChart points={backtest.equityCurve} />
+        </div>
+
         <div className="kpi-grid" style={{ marginBottom: 14 }}>
           <div className="kv-item">
-            <div className="kv-label">Guarded Final NAV</div>
+            <div className="kv-label">Guarded Scenario Ending NAV</div>
             <div className="kv-val mono text-emerald" style={{ fontSize: 17 }}>
-              ${backtest.finalGuardedNavUsd.toLocaleString()} (+{backtest.netReturnPct}%)
+              ${backtest.finalGuardedNavUsd.toLocaleString()} ({backtest.netReturnPct >= 0 ? "+" : ""}
+              {backtest.netReturnPct}%)
             </div>
           </div>
           <div className="kv-item">
-            <div className="kv-label">Unguarded Bot NAV</div>
+            <div className="kv-label">Unguarded Bot Ending NAV</div>
             <div className="kv-val mono text-rose" style={{ fontSize: 17 }}>
               ${backtest.finalUnguardedNavUsd.toLocaleString()}
             </div>
@@ -158,9 +188,9 @@ export function ArbitrageBacktestView({
             </div>
           </div>
           <div className="kv-item">
-            <div className="kv-label">Profit Factor / Gas Spent</div>
+            <div className="kv-label">Blocked Shocks / Est. Gas</div>
             <div className="kv-val mono" style={{ fontSize: 17 }}>
-              {backtest.profitFactor}x · {backtest.totalGasHsk} HSK
+              {backtest.blockedAdverseSwaps} MEV · {backtest.totalGasHsk} HSK
             </div>
           </div>
         </div>
@@ -168,13 +198,13 @@ export function ArbitrageBacktestView({
         <table className="data-table">
           <thead>
             <tr>
-              <th>Strategy Attribution Bucket</th>
-              <th>Trades</th>
-              <th>Win Rate</th>
+              <th>Scenario Sleeve</th>
+              <th>Simulated Trades</th>
+              <th>Guard Blocks / Holds</th>
               <th>Gross PnL</th>
               <th>Fees &amp; HSK Gas</th>
               <th>Net PnL</th>
-              <th style={{ width: "22%" }}>Contribution Share</th>
+              <th>Guard Behavior</th>
             </tr>
           </thead>
           <tbody>
@@ -184,9 +214,11 @@ export function ArbitrageBacktestView({
                   <strong>{row.strategy}</strong>
                 </td>
                 <td className="mono">{row.trades}</td>
-                <td className="mono">{row.winRatePct}%</td>
+                <td className="mono text-cyan">{row.blockedEvents}</td>
                 <td className="mono">
-                  {row.grossPnlUsd < 0 ? `-$${Math.abs(row.grossPnlUsd).toLocaleString()}` : `$${row.grossPnlUsd.toLocaleString()}`}
+                  {row.grossPnlUsd < 0
+                    ? `-$${Math.abs(row.grossPnlUsd).toLocaleString()}`
+                    : `$${row.grossPnlUsd.toLocaleString()}`}
                 </td>
                 <td className="mono text-muted">-${row.feesAndGasUsd.toLocaleString()}</td>
                 <td className={`mono ${row.netPnlUsd >= 0 ? "text-emerald" : "text-rose"}`}>
@@ -194,19 +226,7 @@ export function ArbitrageBacktestView({
                     ? `+$${row.netPnlUsd.toLocaleString()}`
                     : `-$${Math.abs(row.netPnlUsd).toLocaleString()}`}
                 </td>
-                <td>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div className="progress-track" style={{ flex: 1 }}>
-                      <div
-                        className="progress-fill"
-                        style={{ width: `${row.contributionPct}%`, background: "var(--accent-cyan)" }}
-                      />
-                    </div>
-                    <span className="mono" style={{ fontSize: 11.5, minWidth: 38, textAlign: "right" }}>
-                      {row.contributionPct}%
-                    </span>
-                  </div>
-                </td>
+                <td style={{ fontSize: 11.5, color: "var(--text-secondary)" }}>{row.guardImpactNote}</td>
               </tr>
             ))}
           </tbody>
@@ -222,16 +242,18 @@ export function ArbitrageBacktestView({
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
+            gap: 10,
             fontSize: 12,
+            flexWrap: "wrap",
           }}
         >
           <span style={{ display: "inline-flex", alignItems: "center", gap: 7, color: "#6ee7b7" }}>
             <ShieldCheck size={15} />
-            HorizonGuardVault blocked adverse MEV slippage spikes and latched circuit breaker on flash-crash shocks.
+            Illustrative model only: shows how oracle slippage floor, fee-hurdle HOLDs, and daily drawdown cap limit tail losses.
           </span>
-          <span className="mono text-emerald">
-            Slippage Saved: ${backtest.slippageSavedUsd.toLocaleString()} · Outperformance: +$
-            {(backtest.finalGuardedNavUsd - backtest.finalUnguardedNavUsd).toFixed(2)}
+          <span className="mono text-emerald" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <AlertCircle size={13} />
+            Drawdown Saved: -{backtest.drawdownSavedPct.toFixed(2)}% · Slippage Saved: ${backtest.slippageSavedUsd.toFixed(2)}
           </span>
         </div>
       </div>
