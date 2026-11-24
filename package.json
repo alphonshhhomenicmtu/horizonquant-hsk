@@ -1,0 +1,22 @@
+{
+  "name": "horizonquant-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HorizonQuant Agent — Non-custodial AI Agent Trading & On-Chain Risk Vault on HashKey Chain (Chain ID 177)",
+  "workspaces": [
+    "packages/agent",
+    "apps/web"
+  ],
+  "scripts": {
+    "test": "npm --workspace @horizonquant/agent run test",
+    "build": "npm --workspace @horizonquant/agent run build && npm --workspace @horizonquant/web run build",
+    "dev:web": "npm --workspace @horizonquant/web run dev",
+    "dev:api": "npm --workspace @horizonquant/agent run dev:api",
+    "deploy:mainnet": "npm --workspace @horizonquant/agent run deploy:mainnet",
+    "deploy:testnet": "npm --workspace @horizonquant/agent run deploy:testnet",
+    "typecheck": "npm --workspace @horizonquant/agent run typecheck && npm --workspace @horizonquant/web run typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
