@@ -4,6 +4,8 @@
 
 Built for **DoraHacks HSK Chain Horizon Hackathon · Seoul — Track 1: AI Agent Trading**.
 
+**Live Terminal (GitHub Pages)**: [https://alphonshhhomenicmtu.github.io/horizonquant-hsk/](https://alphonshhhomenicmtu.github.io/horizonquant-hsk/)
+
 HorizonQuant separates **autonomous alpha generation** (off-chain regime momentum, mean-reversion, and live HSKSwap V3 cross-fee-tier spread detection) from **hard risk enforcement** (on-chain `HorizonGuardVault.sol` enforcing EIP-712 session keys, per-trade slippage ceilings, max position sizing, rolling UTC 24h high-water daily drawdown circuit breakers, and strict HSKSwap router/pair allowlists). Even if an off-chain AI model hallucinates or market liquidity collapses, the smart contract refuses unsafe trades at the EVM level.
 
 ---

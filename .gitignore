@@ -6,5 +6,6 @@ dist/
 contracts/cache/
 contracts/out/
 contracts/broadcast/
+demo-video/
 *.log
 .DS_Store
