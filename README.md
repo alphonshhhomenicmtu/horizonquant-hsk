@@ -6,6 +6,8 @@ Built for **DoraHacks HSK Chain Horizon Hackathon · Seoul — Track 1: AI Agent
 
 **Live Web Terminal (GitHub Pages)**: [https://alphonshhhomenicmtu.github.io/horizonquant-hsk/](https://alphonshhhomenicmtu.github.io/horizonquant-hsk/)
 
+**Architecture & Security Audit Deck (PDF)**: [https://alphonshhhomenicmtu.github.io/horizonquant-hsk/horizonquant-deck.pdf](https://alphonshhhomenicmtu.github.io/horizonquant-hsk/horizonquant-deck.pdf) ([`docs/horizonquant-deck.pdf`](docs/horizonquant-deck.pdf))
+
 HorizonQuant splits off-chain market monitoring and deterministic policy compilation from hard EVM risk enforcement inside `HorizonGuardVault.sol`. The owner keeps full cold custody of vault funds; the trading agent holds only a scoped EIP-712 session key that can never equal the owner, withdraw capital, bypass the on-chain TWAP slippage floor, or push past daily loss limits.
 
 ---
