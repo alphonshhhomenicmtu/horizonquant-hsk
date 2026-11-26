@@ -309,16 +309,17 @@ contract HorizonGuardVault {
     /// @notice Deposit tracked ERC-20 tokens into the non-custodial vault.
     /// @dev Scales daily NAV baselines pro-rata (`baseline * navAfter / navBefore`) so inflows preserve
     ///      existing drawdown percentages without masking trading losses.
+    // slither-disable-next-line reentrancy-no-eth
     function deposit(address token, uint256 amount) external nonReentrant onlyOwner {
         if (amount == 0) revert ZeroAmount();
         if (!isTrackedToken[token]) revert UntrackedToken(token);
 
         _rollDayIfNeeded();
-        uint256 navBefore = computeTotalNavE18();
+        uint256 navBefore = _computeTotalNavE18();
 
         _safeTransferFrom(token, msg.sender, address(this), amount);
 
-        uint256 navAfter = computeTotalNavE18();
+        uint256 navAfter = _computeTotalNavE18();
         _scaleBaselinesProRata(navBefore, navAfter);
 
         emit Deposited(msg.sender, token, amount, navAfter);
@@ -327,16 +328,17 @@ contract HorizonGuardVault {
     /// @notice Withdraw ERC-20 tokens back to the owner or a designated recipient.
     /// @dev Scales daily NAV baselines pro-rata (`baseline * navAfter / navBefore`) so withdrawals preserve
     ///      existing drawdown percentages without falsely tripping the circuit breaker.
+    // slither-disable-next-line reentrancy-no-eth
     function withdraw(address token, uint256 amount, address recipient) external nonReentrant onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
         _rollDayIfNeeded();
-        uint256 navBefore = computeTotalNavE18();
+        uint256 navBefore = _computeTotalNavE18();
 
         _safeTransfer(token, recipient, amount);
 
-        uint256 navAfter = computeTotalNavE18();
+        uint256 navAfter = _computeTotalNavE18();
         if (isTrackedToken[token]) {
             _scaleBaselinesProRata(navBefore, navAfter);
         }
@@ -355,7 +357,7 @@ contract HorizonGuardVault {
             _safeTransfer(token, recipient, balance);
         }
 
-        uint256 navAfter = computeTotalNavE18();
+        uint256 navAfter = _computeTotalNavE18();
         dayStartNavE18 = navAfter;
         dayHighWaterNavE18 = navAfter;
 
@@ -380,7 +382,7 @@ contract HorizonGuardVault {
     function resetCircuitBreaker() external nonReentrant onlyOwner {
         circuitBreakerTripped = false;
         currentDayIndex = block.timestamp / 1 days;
-        uint256 nav = computeTotalNavE18();
+        uint256 nav = _computeTotalNavE18();
         dayStartNavE18 = nav;
         dayHighWaterNavE18 = nav;
         dailyTradeCount = 0;
@@ -456,6 +458,7 @@ contract HorizonGuardVault {
 
     function setAllowedPair(address tokenIn, address tokenOut, uint24 fee, bool allowed) external onlyOwner {
         if (tokenIn == address(0) || tokenOut == address(0) || tokenIn == tokenOut) revert ZeroAddress();
+        if (fee >= FEE_DENOMINATOR) revert InvalidOracleConfig();
         allowedPairs[pairKey(tokenIn, tokenOut, fee)] = allowed;
         emit PairAllowlistUpdated(tokenIn, tokenOut, fee, allowed);
     }
@@ -468,6 +471,7 @@ contract HorizonGuardVault {
 
     function registerToken(address token, uint8 decimals_, uint256 initialPriceE18) external onlyOwner {
         if (token == address(0)) revert ZeroAddress();
+        if (token == quoteToken) revert InvalidOracleConfig();
         if (initialPriceE18 == 0) revert ZeroAmount();
         _registerToken(token, decimals_, initialPriceE18);
         emit ReferencePriceUpdated(token, initialPriceE18, address(0));
@@ -556,7 +560,7 @@ contract HorizonGuardVault {
     /// @dev Safe to keep callable by watchdogs because `referencePriceE18` can only be moved by owner or guarded TWAP keepers.
     function checkAndTripCircuitBreaker() external nonReentrant returns (bool tripped) {
         _rollDayIfNeeded();
-        uint256 nav = computeTotalNavE18();
+        uint256 nav = _computeTotalNavE18();
         uint256 ddBps = _computeDrawdownBps(nav, dayHighWaterNavE18);
         if (ddBps >= policy.dailyDrawdownCapBps) {
             circuitBreakerTripped = true;
@@ -571,6 +575,9 @@ contract HorizonGuardVault {
     // =========================================================================
 
     /// @notice Execute an AI agent's EIP-712 signed swap intent on an allowlisted HSKSwap router under hard on-chain guardrails.
+    /// @dev Protected by `nonReentrant` and read-only reentrancy guards on NAV/drawdown views; balance delta and
+    ///      post-trade NAV/circuit-breaker updates intentionally observe actual post-swap balances.
+    // slither-disable-next-line reentrancy-no-eth,reentrancy-balance
     function executeGuardedSwap(
         TradeIntent calldata intent,
         bytes calldata signature
@@ -626,7 +633,7 @@ contract HorizonGuardVault {
         }
 
         // 6. Post-trade mark-to-market NAV evaluation & automatic circuit breaker latch
-        uint256 postNavE18 = computeTotalNavE18();
+        uint256 postNavE18 = _computeTotalNavE18();
         if (postNavE18 > dayHighWaterNavE18) {
             dayHighWaterNavE18 = postNavE18;
         }
@@ -720,6 +727,7 @@ contract HorizonGuardVault {
     ) external view returns (uint256 oracleFairOut, uint256 oracleMinOut) {
         if (!isTrackedToken[tokenIn]) revert UntrackedToken(tokenIn);
         if (!isTrackedToken[tokenOut]) revert UntrackedToken(tokenOut);
+        if (fee >= FEE_DENOMINATOR) revert InvalidOracleConfig();
         if (amountIn == 0) revert ZeroAmount();
         if (maxSlippageBps == 0 || maxSlippageBps > policy.maxSlippageBps) {
             revert SlippageCapExceeded(maxSlippageBps, policy.maxSlippageBps);
@@ -733,7 +741,20 @@ contract HorizonGuardVault {
         oracleMinOut = _mulDiv(oracleFairOut, BPS_DENOMINATOR - uint256(maxSlippageBps), BPS_DENOMINATOR);
     }
 
+    /// @notice Computes mark-to-market NAV in 1e18 quote USD. Guards against read-only reentrancy during callbacks.
     function computeTotalNavE18() public view returns (uint256 totalNavE18) {
+        if (_reentrancyLock != 1) revert ReentrancyDetected();
+        return _computeTotalNavE18();
+    }
+
+    function currentDailyDrawdownBps() external view returns (uint256) {
+        if (_reentrancyLock != 1) revert ReentrancyDetected();
+        uint256 nav = _computeTotalNavE18();
+        uint256 highWater = (block.timestamp / 1 days > currentDayIndex) ? nav : dayHighWaterNavE18;
+        return _computeDrawdownBps(nav, highWater);
+    }
+
+    function _computeTotalNavE18() internal view returns (uint256 totalNavE18) {
         uint256 len = trackedTokens.length;
         for (uint256 i = 0; i < len; ++i) {
             address tok = trackedTokens[i];
@@ -742,12 +763,6 @@ contract HorizonGuardVault {
                 totalNavE18 += _valueInQuoteE18(tok, bal);
             }
         }
-    }
-
-    function currentDailyDrawdownBps() external view returns (uint256) {
-        uint256 nav = computeTotalNavE18();
-        uint256 highWater = (block.timestamp / 1 days > currentDayIndex) ? nav : dayHighWaterNavE18;
-        return _computeDrawdownBps(nav, highWater);
     }
 
     function getExecutionCount() external view returns (uint256) {
@@ -819,10 +834,10 @@ contract HorizonGuardVault {
         ctx.tradeNotionalE18 = _mulDiv(intent.amountIn, priceInE18, 10 ** uint256(tokenDecimals[intent.tokenIn]));
         uint256 grossFairOut = _mulDiv(ctx.tradeNotionalE18, 10 ** uint256(tokenDecimals[intent.tokenOut]), priceOutE18);
         ctx.oracleFairOut = _mulDiv(grossFairOut, FEE_DENOMINATOR - uint256(intent.fee), FEE_DENOMINATOR);
-        if (ctx.oracleFairOut == 0) revert ZeroAmount();
+        if (ctx.oracleFairOut < 1) revert ZeroAmount();
 
         ctx.oracleMinOut = _mulDiv(ctx.oracleFairOut, BPS_DENOMINATOR - uint256(intent.maxSlippageBps), BPS_DENOMINATOR);
-        if (ctx.oracleMinOut == 0) revert ZeroAmount();
+        if (ctx.oracleMinOut < 1) revert ZeroAmount();
         if (intent.minAmountOut < ctx.oracleMinOut) {
             revert MinAmountOutBelowOracleFloor(intent.minAmountOut, ctx.oracleMinOut);
         }
@@ -844,7 +859,7 @@ contract HorizonGuardVault {
         }
 
         // 6. Pre-trade daily drawdown check (reverts immediately before spending funds)
-        uint256 preNav = computeTotalNavE18();
+        uint256 preNav = _computeTotalNavE18();
         uint256 preDrawdownBps = _computeDrawdownBps(preNav, dayHighWaterNavE18);
         if (preDrawdownBps >= policy.dailyDrawdownCapBps) {
             revert DailyDrawdownExceeded(preDrawdownBps, policy.dailyDrawdownCapBps);
@@ -853,7 +868,7 @@ contract HorizonGuardVault {
 
     function _getFreshPriceE18(address token) internal view returns (uint256 priceE18) {
         priceE18 = referencePriceE18[token];
-        if (priceE18 == 0) revert ZeroAmount();
+        if (priceE18 < 1) revert ZeroAmount();
         if (token == quoteToken) return priceE18;
 
         OracleConfig memory cfg = oracleConfigs[token];
@@ -913,10 +928,19 @@ contract HorizonGuardVault {
             revert InsufficientPoolLiquidity(cfg.pool, liq, cfg.minLiquidity);
         }
 
+        int24 spotTick;
+        uint16 obsIdx;
+        uint16 obsCard;
+        uint16 obsCardNext;
+        uint8 feeProto;
         bool unlocked;
-        (spotSqrtPriceX96,,,,,, unlocked) = v3Pool.slot0();
+        (spotSqrtPriceX96, spotTick, obsIdx, obsCard, obsCardNext, feeProto, unlocked) = v3Pool.slot0();
         if (!unlocked) revert PoolLocked(cfg.pool);
-        if (spotSqrtPriceX96 == 0) revert ZeroAmount();
+        if (spotSqrtPriceX96 < MIN_SQRT_RATIO || spotSqrtPriceX96 > MAX_SQRT_RATIO) revert ZeroAmount();
+        if (spotTick < -MAX_TICK || spotTick > MAX_TICK) revert InvalidTick();
+        if (obsCard < 1 || obsIdx >= obsCard || obsCardNext < obsCard || (feeProto == 0xFF && obsCard < 1)) {
+            revert InvalidOracleConfig();
+        }
 
         address t0 = v3Pool.token0();
         address t1 = v3Pool.token1();
@@ -979,18 +1003,19 @@ contract HorizonGuardVault {
         uint256 dayIdx = block.timestamp / 1 days;
         if (dayIdx > currentDayIndex) {
             currentDayIndex = dayIdx;
-            uint256 nav = computeTotalNavE18();
+            uint256 nav = _computeTotalNavE18();
             dayStartNavE18 = nav;
             dayHighWaterNavE18 = nav;
             dailyTradeCount = 0;
         } else if (dayHighWaterNavE18 < 1) {
-            uint256 nav = computeTotalNavE18();
+            uint256 nav = _computeTotalNavE18();
             dayStartNavE18 = nav;
             dayHighWaterNavE18 = nav;
         }
     }
 
     function _registerToken(address token, uint8 decimals_, uint256 initialPriceE18) internal {
+        if (decimals_ > 18) revert InvalidOracleConfig();
         if (!isTrackedToken[token]) {
             if (trackedTokens.length >= MAX_TRACKED_TOKENS) revert MaxTrackedTokensReached();
             isTrackedToken[token] = true;
@@ -1006,12 +1031,12 @@ contract HorizonGuardVault {
     }
 
     function _computeDrawdownBps(uint256 navE18, uint256 highWaterE18) internal pure returns (uint256) {
-        if (highWaterE18 == 0 || navE18 >= highWaterE18) return 0;
+        if (highWaterE18 < 1 || navE18 >= highWaterE18) return 0;
         return _mulDiv(highWaterE18 - navE18, BPS_DENOMINATOR, highWaterE18);
     }
 
     function _computeDeviationBps(uint256 a, uint256 b) internal pure returns (uint256) {
-        if (b == 0) return BPS_DENOMINATOR;
+        if (b < 1) return BPS_DENOMINATOR;
         uint256 diff = a >= b ? a - b : b - a;
         return _mulDiv(diff, BPS_DENOMINATOR, b);
     }
@@ -1020,7 +1045,7 @@ contract HorizonGuardVault {
         uint256 referenceExpectedOut,
         uint256 actualAmountOut
     ) internal pure returns (uint16) {
-        if (actualAmountOut >= referenceExpectedOut || referenceExpectedOut == 0) return 0;
+        if (referenceExpectedOut < 1 || actualAmountOut >= referenceExpectedOut) return 0;
         uint256 bps = _mulDiv(referenceExpectedOut - actualAmountOut, BPS_DENOMINATOR, referenceExpectedOut);
         return bps > type(uint16).max ? type(uint16).max : uint16(bps);
     }
@@ -1057,6 +1082,7 @@ contract HorizonGuardVault {
     }
 
     /// @dev Exact Uniswap V3 TickMath.getSqrtRatioAtTick conversion for TWAP tick -> sqrtPriceX96.
+    // slither-disable-next-line divide-before-multiply
     function _getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
         unchecked {
             uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
@@ -1099,7 +1125,7 @@ contract HorizonGuardVault {
     ) internal pure returns (uint256) {
         uint256 s = uint256(sqrtPriceX96);
         uint256 priceX96 = _mulDiv(s, s, Q96);
-        if (priceX96 == 0) return 0;
+        if (priceX96 < 1) return 0;
 
         if (tokenIsToken0) {
             if (tokDec >= qDec) {
@@ -1121,6 +1147,8 @@ contract HorizonGuardVault {
     }
 
     /// @dev 512-bit precision floor(a * b / denominator) based on Remco Bloemen's FullMath.
+    ///      `denominator := div(denominator, twos)` is exact power-of-2 stripping before Newton-Raphson inversion.
+    // slither-disable-next-line divide-before-multiply
     function _mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
         unchecked {
             uint256 prod0;
@@ -1130,7 +1158,7 @@ contract HorizonGuardVault {
                 prod0 := mul(a, b)
                 prod1 := sub(sub(mm, prod0), lt(mm, prod0))
             }
-            if (prod1 == 0) {
+            if (prod1 < 1) {
                 require(denominator > 0, "DIV0");
                 assembly {
                     result := div(prod0, denominator)
@@ -1150,7 +1178,8 @@ contract HorizonGuardVault {
                 prod0 := div(prod0, twos)
                 twos := add(div(sub(0, twos), twos), 1)
                 prod0 := or(prod0, mul(prod1, twos))
-                let inv := xor(mul(3, denominator), 2)
+                let t := mul(3, denominator)
+                let inv := sub(add(t, 2), shl(1, and(t, 2)))
                 inv := mul(inv, sub(2, mul(denominator, inv)))
                 inv := mul(inv, sub(2, mul(denominator, inv)))
                 inv := mul(inv, sub(2, mul(denominator, inv)))

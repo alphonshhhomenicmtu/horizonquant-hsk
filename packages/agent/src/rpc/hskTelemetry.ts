@@ -214,14 +214,28 @@ export function decodeSqrtPriceX96ToSpot(
   token0Decimals: number,
   token1Decimals: number,
 ): number {
+  if (sqrtPriceX96 <= 0n || !Number.isFinite(token0Decimals) || !Number.isFinite(token1Decimals)) {
+    return 0;
+  }
   const ratio = Number(sqrtPriceX96) / 2 ** 96;
   const rawPrice = ratio * ratio;
   const decimalFactor = 10 ** (token0Decimals - token1Decimals);
-  return rawPrice * decimalFactor;
+  const price = rawPrice * decimalFactor;
+  return Number.isFinite(price) && price > 0 ? price : 0;
 }
 
 export function tickToSpotPrice(tick: number, token0Decimals: number, token1Decimals: number): number {
-  return Math.pow(1.0001, tick) * 10 ** (token0Decimals - token1Decimals);
+  if (
+    !Number.isFinite(tick) ||
+    tick < -887_272 ||
+    tick > 887_272 ||
+    !Number.isFinite(token0Decimals) ||
+    !Number.isFinite(token1Decimals)
+  ) {
+    return 0;
+  }
+  const price = Math.pow(1.0001, tick) * 10 ** (token0Decimals - token1Decimals);
+  return Number.isFinite(price) && price > 0 ? price : 0;
 }
 
 /**
@@ -233,10 +247,14 @@ export function estimatePool2PctDepthUsd(
   sqrtPriceX96: bigint,
   token1Decimals: number,
 ): number {
+  if (liquidity <= 0n || sqrtPriceX96 <= 0n || !Number.isFinite(token1Decimals) || token1Decimals < 0) {
+    return 0;
+  }
   const sqrtP = Number(sqrtPriceX96) / 2 ** 96;
   const deltaYRaw = Number(liquidity) * sqrtP * (1 - 1 / Math.sqrt(1.02));
   const depthUsd = deltaYRaw / 10 ** token1Decimals;
-  return Number(Math.max(0, depthUsd).toFixed(4));
+  if (!Number.isFinite(depthUsd) || depthUsd <= 0) return 0;
+  return Number(depthUsd.toFixed(4));
 }
 
 function decodeSignedInt24(wordHex: string): number {
@@ -332,7 +350,14 @@ export function computeCrossTierSpread(pools: PoolTelemetry[]): {
 } {
   const p500 = pools.find((p) => p.fee === 500);
   const p3000 = pools.find((p) => p.fee === 3000);
-  if (!p500 || !p3000 || p500.spotPriceUsdt <= 0 || p3000.spotPriceUsdt <= 0) {
+  if (
+    !p500 ||
+    !p3000 ||
+    !Number.isFinite(p500.spotPriceUsdt) ||
+    !Number.isFinite(p3000.spotPriceUsdt) ||
+    p500.spotPriceUsdt <= 0 ||
+    p3000.spotPriceUsdt <= 0
+  ) {
     return { crossTierSpreadBps: 0, spreadDirection: "Parity across fee tiers" };
   }
   const diff = Math.abs(p3000.spotPriceUsdt - p500.spotPriceUsdt);
@@ -360,6 +385,9 @@ export async function fetchMainnetTelemetry(
       ]);
       const chainId = Number(BigInt(chainIdHex));
       const blockNumber = Number(BigInt(blockHex));
+      if (chainId !== HASHKEY_MAINNET.chainId || !Number.isFinite(blockNumber) || blockNumber <= 0) {
+        throw new Error(`Unexpected chain telemetry (chainId=${chainId}, block=${blockNumber})`);
+      }
       const gasPriceWei = BigInt(gasHex);
       const gasPriceGwei = Number(gasPriceWei) / 1e9;
 
@@ -377,9 +405,13 @@ export async function fetchMainnetTelemetry(
       ]);
 
       const primary = pools[0];
-      const whskUsdtSpot = primary?.spotPriceUsdt ?? VERIFIED_MAINNET_SNAPSHOT.whskUsdtSpot;
-      const whskTwapUsdt = primary?.twapPriceUsdt ?? whskUsdtSpot;
-      const spotVsTwapDiffBps = primary?.spotVsTwapDiffBps ?? 0;
+      if (!primary || !Number.isFinite(primary.spotPriceUsdt) || primary.spotPriceUsdt <= 0) {
+        throw new Error("Invalid or zero primary pool spot price from RPC");
+      }
+      const whskUsdtSpot = primary.spotPriceUsdt;
+      const whskTwapUsdt =
+        Number.isFinite(primary.twapPriceUsdt) && primary.twapPriceUsdt > 0 ? primary.twapPriceUsdt : whskUsdtSpot;
+      const spotVsTwapDiffBps = primary.spotVsTwapDiffBps;
       const { crossTierSpreadBps, spreadDirection } = computeCrossTierSpread(pools);
 
       const zeroAddr = "0x0000000000000000000000000000000000000000";

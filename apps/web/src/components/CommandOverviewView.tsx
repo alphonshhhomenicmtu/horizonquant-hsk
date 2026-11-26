@@ -134,7 +134,7 @@ export function CommandOverviewView({
             <ShieldAlert size={14} className="text-cyan" />
           </div>
           <div className="kpi-value mono text-emerald" style={{ fontSize: 18 }}>
-            28/28 Forge · 5 Invariants
+            40/40 Forge · 8 Invariants
           </div>
           <div className="kpi-meta">
             <span>1-wei &amp; stale oracle blocked</span>

@@ -94,16 +94,23 @@ export function runGuardrailStressScenario(
   profile: "CONSERVATIVE" | "BALANCED" | "AGGRESSIVE" = "BALANCED",
   whskSpotUsd = 0.100013,
 ): BacktestReport {
-  const posFraction = Math.min(1, policy.maxPositionBps / 10_000);
-  const ddCapFraction = policy.dailyDrawdownCapBps / 10_000;
+  const safeInitialNav = Number.isFinite(initialNavUsd) && initialNavUsd > 0 ? initialNavUsd : 1_000;
+  const safeWhskSpot = Number.isFinite(whskSpotUsd) && whskSpotUsd > 0 ? whskSpotUsd : 0.100013;
+  const safeMaxPosBps = Number.isFinite(policy.maxPositionBps) ? Math.max(1, Math.min(10_000, policy.maxPositionBps)) : 2500;
+  const safeDdCapBps = Number.isFinite(policy.dailyDrawdownCapBps) ? Math.max(1, Math.min(2500, policy.dailyDrawdownCapBps)) : 300;
+  const safeMaxSlipBps = Number.isFinite(policy.maxSlippageBps) ? Math.max(1, Math.min(500, policy.maxSlippageBps)) : 50;
+  const safeMaxDailyTrades = Number.isFinite(policy.maxDailyTrades) ? Math.max(1, Math.floor(policy.maxDailyTrades)) : 24;
+
+  const posFraction = Math.min(1, safeMaxPosBps / 10_000);
+  const ddCapFraction = safeDdCapBps / 10_000;
   const profileMultiplier = profile === "CONSERVATIVE" ? 0.65 : profile === "AGGRESSIVE" ? 1.2 : 1.0;
 
-  let guardedNav = initialNavUsd;
-  let unguardedNav = initialNavUsd;
-  let benchmarkNav = initialNavUsd;
+  let guardedNav = safeInitialNav;
+  let unguardedNav = safeInitialNav;
+  let benchmarkNav = safeInitialNav;
 
-  let guardedPeak = initialNavUsd;
-  let unguardedPeak = initialNavUsd;
+  let guardedPeak = safeInitialNav;
+  let unguardedPeak = safeInitialNav;
   let maxGuardedDd = 0;
   let maxUnguardedDd = 0;
 
@@ -124,9 +131,9 @@ export function runGuardrailStressScenario(
     {
       day: 0,
       label: "D0",
-      guardedNavUsd: initialNavUsd,
-      unguardedNavUsd: initialNavUsd,
-      benchmarkNavUsd: initialNavUsd,
+      guardedNavUsd: safeInitialNav,
+      unguardedNavUsd: safeInitialNav,
+      benchmarkNavUsd: safeInitialNav,
       guardedDrawdownPct: 0,
       regime: "MOMENTUM",
       circuitBreakerTriggered: false,
@@ -140,9 +147,9 @@ export function runGuardrailStressScenario(
     benchmarkNav = benchmarkNav * (1 + (bar.hskRetPct / 100) * 0.5);
 
     const notional = Math.min(guardedNav, guardedNav * posFraction * profileMultiplier);
-    const tradesToday = bar.regime === "HOLD_FEE_GUARD" ? 0 : Math.min(policy.maxDailyTrades, 2);
+    const tradesToday = bar.regime === "HOLD_FEE_GUARD" ? 0 : Math.min(safeMaxDailyTrades, 2);
     const gasHskToday = tradesToday * 0.115;
-    const gasUsdToday = gasHskToday * whskSpotUsd;
+    const gasUsdToday = gasHskToday * safeWhskSpot;
 
     // Unguarded bot executes blindly even during spread/MEV shocks without slippage floor or circuit breaker
     const unguardedNotional = unguardedNav * 0.45;
@@ -153,15 +160,15 @@ export function runGuardrailStressScenario(
           ? -(unguardedNotional * 35) / 10_000 // unguarded bot churns unprofitable 35 bps fee spreads
           : unguardedNotional * ((bar.hskRetPct * 0.35) / 100) -
             (unguardedNotional * bar.adverseSlippageEventBps) / 10_000;
-    unguardedNav = Math.max(initialNavUsd * 0.1, unguardedNav + unguardedDayDelta - 2 * 0.115 * whskSpotUsd);
+    unguardedNav = Math.max(safeInitialNav * 0.1, unguardedNav + unguardedDayDelta - 2 * 0.115 * safeWhskSpot);
 
     let cbTriggered = false;
     let dayGrossPnl = 0;
     let dayCosts = tradesToday > 0 ? gasUsdToday + (notional * 5) / 10_000 : 0;
 
     if (bar.regime === "SHOCK_PROTECTED") {
-      if (bar.adverseSlippageEventBps > policy.maxSlippageBps) {
-        const saved = (notional * (bar.adverseSlippageEventBps - policy.maxSlippageBps)) / 10_000;
+      if (bar.adverseSlippageEventBps > safeMaxSlipBps) {
+        const saved = (notional * (bar.adverseSlippageEventBps - safeMaxSlipBps)) / 10_000;
         slippageSavedUsd += saved;
         blockedAdverseSwaps += 1;
         buckets.SHOCK_CB.blocked += 1;
@@ -202,7 +209,7 @@ export function runGuardrailStressScenario(
     }
 
     const dayNetPnl = dayGrossPnl - dayCosts;
-    guardedNav = Math.max(initialNavUsd * 0.1, guardedNav + dayNetPnl);
+    guardedNav = Math.max(safeInitialNav * 0.1, guardedNav + dayNetPnl);
 
     if (guardedNav > guardedPeak) guardedPeak = guardedNav;
     if (unguardedNav > unguardedPeak) unguardedPeak = unguardedNav;
@@ -224,8 +231,8 @@ export function runGuardrailStressScenario(
     });
   }
 
-  const netPnlUsd = Number((guardedNav - initialNavUsd).toFixed(2));
-  const netReturnPct = Number(((netPnlUsd / initialNavUsd) * 100).toFixed(2));
+  const netPnlUsd = Number((guardedNav - safeInitialNav).toFixed(2));
+  const netReturnPct = Number(((netPnlUsd / safeInitialNav) * 100).toFixed(2));
 
   const attribution: StrategyAttributionRow[] = [
     {
@@ -271,7 +278,7 @@ export function runGuardrailStressScenario(
       "Illustrative 30-day synthetic stress scenario modeling HorizonGuardVault drawdown & slippage caps against an unguarded bot — not a historical live trading backtest.",
     profile,
     horizonDays: STRESS_SCENARIO_TAPE.length,
-    initialNavUsd,
+    initialNavUsd: safeInitialNav,
     finalGuardedNavUsd: Number(guardedNav.toFixed(2)),
     finalUnguardedNavUsd: Number(unguardedNav.toFixed(2)),
     netPnlUsd,
@@ -284,7 +291,7 @@ export function runGuardrailStressScenario(
     blockedAdverseSwaps,
     totalTrades,
     totalGasHsk: Number(totalGasHsk.toFixed(3)),
-    totalGasUsd: Number((totalGasHsk * whskSpotUsd).toFixed(2)),
+    totalGasUsd: Number((totalGasHsk * safeWhskSpot).toFixed(2)),
     equityCurve,
     attribution,
   };

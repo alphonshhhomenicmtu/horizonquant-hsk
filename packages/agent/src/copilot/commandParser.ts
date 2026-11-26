@@ -94,8 +94,15 @@ function extractTargetPairs(input: string): { livePairs: string[]; unavailablePa
 }
 
 export function computeVaultNavUsd(vault: VaultRuntimeState, telemetry: ChainTelemetrySnapshot): number {
-  const whskPrice = telemetry.whskTwapUsdt || telemetry.whskUsdtSpot;
-  return Number((vault.balances.USDT + vault.balances.WHSK * whskPrice).toFixed(2));
+  const whskPrice =
+    Number.isFinite(telemetry.whskTwapUsdt) && telemetry.whskTwapUsdt > 0
+      ? telemetry.whskTwapUsdt
+      : Number.isFinite(telemetry.whskUsdtSpot) && telemetry.whskUsdtSpot > 0
+        ? telemetry.whskUsdtSpot
+        : 0;
+  const usdt = Number.isFinite(vault.balances.USDT) && vault.balances.USDT > 0 ? vault.balances.USDT : 0;
+  const whsk = Number.isFinite(vault.balances.WHSK) && vault.balances.WHSK > 0 ? vault.balances.WHSK : 0;
+  return Number((usdt + whsk * whskPrice).toFixed(2));
 }
 
 /**
@@ -342,9 +349,16 @@ export function parseAndExecuteCopilotCommand(
     /(?:max|limit|cap)[^\d]{0,12}(\d+)\s*(?:trades|swaps)(?:\s*(?:per|\/)\s*day)?/,
     /(\d+)\s*(?:daily\s+)?(?:trades|swaps)\s*(?:per\s+day|max|cap)/,
   ]);
-  if (maxTrades !== null && maxTrades >= 1 && maxTrades <= PROTOCOL_HARD_LIMITS.MAX_DAILY_TRADES) {
-    nextPolicy.maxDailyTrades = Math.round(maxTrades);
-    policyChanges.push(`Max Daily Trades -> ${Math.round(maxTrades)}/day`);
+  if (maxTrades !== null) {
+    const rounded = Math.round(maxTrades);
+    if (rounded < 1 || rounded > PROTOCOL_HARD_LIMITS.MAX_DAILY_TRADES) {
+      rejectedConstraints.push(
+        `Max daily trades ${rounded} violates policy bounds (1 - ${PROTOCOL_HARD_LIMITS.MAX_DAILY_TRADES}/day).`,
+      );
+    } else {
+      nextPolicy.maxDailyTrades = rounded;
+      policyChanges.push(`Max Daily Trades -> ${rounded}/day`);
+    }
   }
 
   const { livePairs, unavailablePairs } = extractTargetPairs(text);

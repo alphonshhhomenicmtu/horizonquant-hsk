@@ -150,19 +150,39 @@ export interface VaultRuntimeState {
   targetPairs: string[];
 }
 
+function sanitizePositiveSeries(series: number[]): number[] {
+  return series.filter((v) => Number.isFinite(v) && v > 0);
+}
+
+function floorToDecimals(value: number, decimals: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const factor = 10 ** decimals;
+  const floored = Math.floor(value * factor + 1e-12) / factor;
+  return Math.min(value, floored);
+}
+
+function parseNonNegativeBigInt(raw: string | undefined): bigint {
+  if (!raw || !/^\d+$/.test(raw)) return 0n;
+  return BigInt(raw);
+}
+
 export function computeEma(series: number[], period: number): number {
-  if (series.length === 0) return 0;
-  const k = 2 / (period + 1);
-  let ema = series[0];
-  for (let i = 1; i < series.length; i++) {
-    ema = series[i] * k + ema * (1 - k);
+  const clean = sanitizePositiveSeries(series);
+  if (clean.length === 0) return 0;
+  const safePeriod = Number.isFinite(period) ? Math.max(1, Math.floor(period)) : 1;
+  const k = 2 / (safePeriod + 1);
+  let ema = clean[0];
+  for (let i = 1; i < clean.length; i++) {
+    ema = clean[i] * k + ema * (1 - k);
   }
-  return ema;
+  return Number.isFinite(ema) ? ema : 0;
 }
 
 export function computeRsi(series: number[], period = 14): number {
-  if (series.length < 2) return 50;
-  const slice = series.slice(-Math.min(series.length, period + 1));
+  const clean = sanitizePositiveSeries(series);
+  if (clean.length < 2) return 50;
+  const safePeriod = Number.isFinite(period) ? Math.max(1, Math.floor(period)) : 14;
+  const slice = clean.slice(-Math.min(clean.length, safePeriod + 1));
   let gains = 0;
   let losses = 0;
   for (let i = 1; i < slice.length; i++) {
@@ -171,6 +191,7 @@ export function computeRsi(series: number[], period = 14): number {
     else losses -= delta;
   }
   const count = slice.length - 1;
+  if (count <= 0) return 50;
   const avgGain = gains / count;
   const avgLoss = losses / count;
   if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
@@ -179,26 +200,32 @@ export function computeRsi(series: number[], period = 14): number {
 }
 
 export function computeBollingerZ(series: number[], window = 20): number {
-  const slice = series.slice(-Math.min(series.length, window));
+  const clean = sanitizePositiveSeries(series);
+  const safeWindow = Number.isFinite(window) ? Math.max(2, Math.floor(window)) : 20;
+  const slice = clean.slice(-Math.min(clean.length, safeWindow));
   if (slice.length < 2) return 0;
   const mean = slice.reduce((acc, v) => acc + v, 0) / slice.length;
   const variance = slice.reduce((acc, v) => acc + (v - mean) ** 2, 0) / slice.length;
   const std = Math.sqrt(variance);
-  if (std < 1e-12) return 0;
+  if (!Number.isFinite(std) || std < 1e-12) return 0;
   return Number(((slice[slice.length - 1] - mean) / std).toFixed(2));
 }
 
 export function computeRealizedVolPct(series: number[]): number {
-  if (series.length < 3) return 0;
+  const clean = sanitizePositiveSeries(series);
+  if (clean.length < 3) return 0;
   const returns: number[] = [];
-  for (let i = 1; i < series.length; i++) {
-    if (series[i - 1] > 0) {
-      returns.push(Math.log(series[i] / series[i - 1]));
+  for (let i = 1; i < clean.length; i++) {
+    const lr = Math.log(clean[i] / clean[i - 1]);
+    if (Number.isFinite(lr)) {
+      returns.push(lr);
     }
   }
+  if (returns.length < 2) return 0;
   const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
   const variance = returns.reduce((a, r) => a + (r - mean) ** 2, 0) / Math.max(1, returns.length - 1);
-  return Number((Math.sqrt(variance * 24 * 365) * 100).toFixed(2));
+  const vol = Math.sqrt(Math.max(0, variance) * 24 * 365) * 100;
+  return Number.isFinite(vol) ? Number(vol.toFixed(2)) : 0;
 }
 
 export function detectMarketRegime(
@@ -207,7 +234,15 @@ export function detectMarketRegime(
   realizedVolPct: number,
   zScore: number,
 ): MarketRegime {
-  if (realizedVolPct > 85) return "VOLATILE_CAUTION";
+  if (
+    !Number.isFinite(emaFast) ||
+    !Number.isFinite(emaSlow) ||
+    !Number.isFinite(realizedVolPct) ||
+    !Number.isFinite(zScore) ||
+    realizedVolPct > 85
+  ) {
+    return "VOLATILE_CAUTION";
+  }
   const trendBps = emaSlow > 0 ? ((emaFast - emaSlow) / emaSlow) * 10_000 : 0;
   if (trendBps > 25) return "TRENDING_BULL";
   if (trendBps < -25) return "TRENDING_BEAR";
@@ -254,15 +289,37 @@ export function scanArbitrageOpportunities(
   maxPositionBps: number,
 ): ArbitrageOpportunity[] {
   const pool500 = telemetry.pools.find((p) => p.fee === 500);
-  const depthCapUsd = pool500?.approxDepth2PctUsd ?? 8.91;
-  const maxPosUsd = (vaultUsdtBalance * maxPositionBps) / 10_000;
-  const probeNotional = Math.max(10, Math.min(250, maxPosUsd > 0 ? maxPosUsd : 100, Math.max(10, depthCapUsd)));
-  const gasImpactBps = Number((((telemetry.estimatedSwapGasUsd * 2) / probeNotional) * 10_000).toFixed(2));
+  const pool3000 = telemetry.pools.find((p) => p.fee === 3000);
+  const depth500 =
+    pool500 && Number.isFinite(pool500.approxDepth2PctUsd) && pool500.approxDepth2PctUsd > 0
+      ? pool500.approxDepth2PctUsd
+      : 0;
+  const liq500 = parseNonNegativeBigInt(pool500?.liquidity);
+  const liq3000 = parseNonNegativeBigInt(pool3000?.liquidity);
+  const hasLiquidity = depth500 > 0 && liq500 > 0n && liq3000 > 0n;
 
-  const grossTierSpread = telemetry.crossTierSpreadBps;
+  const safeBalance = Number.isFinite(vaultUsdtBalance) && vaultUsdtBalance > 0 ? vaultUsdtBalance : 0;
+  const safePosBps = Number.isFinite(maxPositionBps)
+    ? Math.max(0, Math.min(PROTOCOL_HARD_LIMITS.MAX_POSITION_BPS, maxPositionBps))
+    : 0;
+  const maxPosUsd = (safeBalance * safePosBps) / 10_000;
+  const probeNotional = hasLiquidity
+    ? Math.max(10, Math.min(250, maxPosUsd > 0 ? maxPosUsd : 100, Math.max(10, depth500)))
+    : 0;
+  const safeGasUsd =
+    Number.isFinite(telemetry.estimatedSwapGasUsd) && telemetry.estimatedSwapGasUsd >= 0
+      ? telemetry.estimatedSwapGasUsd
+      : 0;
+  const gasImpactBps =
+    probeNotional > 0 ? Number((((safeGasUsd * 2) / probeNotional) * 10_000).toFixed(2)) : 0;
+
+  const grossTierSpread =
+    Number.isFinite(telemetry.crossTierSpreadBps) && telemetry.crossTierSpreadBps >= 0
+      ? telemetry.crossTierSpreadBps
+      : 0;
   const tierFeesBps = 5 + 30; // 0.05% + 0.30%
   const netTierEdge = Number((grossTierSpread - tierFeesBps - gasImpactBps).toFixed(2));
-  const executable = netTierEdge > 0;
+  const executable = hasLiquidity && netTierEdge > 0;
 
   return [
     {
@@ -275,21 +332,27 @@ export function scanArbitrageOpportunities(
       gasImpactBps,
       netEdgeBps: netTierEdge,
       executable,
-      recommendedNotionalUsd: Number(probeNotional.toFixed(2)),
-      holdReason: executable
-        ? `Spread clears 35 bps fee hurdle + ${gasImpactBps} bps gas (note: two-leg single-swap path is non-atomic)`
-        : `HOLD: Live gross spread (${grossTierSpread.toFixed(1)} bps) is below 35.0 bps combined fee hurdle + ${gasImpactBps.toFixed(1)} bps gas`,
+      recommendedNotionalUsd: floorToDecimals(probeNotional, 2),
+      holdReason: !hasLiquidity
+        ? "HOLD: Zero active liquidity detected in HSKSwap V3 pool(s) — refusing blind execution"
+        : executable
+          ? `Spread clears 35 bps fee hurdle + ${gasImpactBps} bps gas (note: two-leg single-swap path is non-atomic)`
+          : `HOLD: Live gross spread (${grossTierSpread.toFixed(1)} bps) is below 35.0 bps combined fee hurdle + ${gasImpactBps.toFixed(1)} bps gas`,
     },
   ];
 }
 
 export function generateDeterministicPriceSeries(anchorPrice: number, length = 36, driftBps = 6.5): number[] {
+  if (!Number.isFinite(anchorPrice) || anchorPrice <= 0) return [];
+  const safeLen = Number.isFinite(length) ? Math.floor(length) : 0;
+  if (safeLen <= 0) return [];
+  const safeDrift = Number.isFinite(driftBps) ? Math.max(-500, Math.min(500, driftBps)) : 0;
   const prices: number[] = [];
   let p = anchorPrice * 0.965;
-  for (let i = 0; i < length; i++) {
+  for (let i = 0; i < safeLen; i++) {
     const wave = Math.sin(i * 0.52) * 0.0042 + Math.cos(i * 0.27) * 0.0024;
-    const step = 1 + driftBps / 10_000 + wave;
-    p = p * step;
+    const step = 1 + safeDrift / 10_000 + wave;
+    p = Math.max(1e-9, p * step);
     prices.push(Number(p.toFixed(6)));
   }
   prices[prices.length - 1] = Number(anchorPrice.toFixed(6));
@@ -304,16 +367,25 @@ export function evaluatePairSignal(
   nowUnixSec = Math.floor(Date.now() / 1000),
 ): QuantSignal {
   const hasLivePool = pair === "WHSK/USDT";
-  const spotPrice = priceSeries[priceSeries.length - 1] ?? telemetry.whskUsdtSpot;
-  const twapPrice = pair === "WHSK/USDT" ? telemetry.whskTwapUsdt : spotPrice;
+  const cleanSeries = sanitizePositiveSeries(priceSeries);
+  const fallbackSpot =
+    Number.isFinite(telemetry.whskUsdtSpot) && telemetry.whskUsdtSpot > 0 ? telemetry.whskUsdtSpot : 0;
+  const spotPrice = cleanSeries.length > 0 ? cleanSeries[cleanSeries.length - 1] : fallbackSpot;
+  const rawTwap = pair === "WHSK/USDT" ? telemetry.whskTwapUsdt : spotPrice;
+  const twapPrice = Number.isFinite(rawTwap) && rawTwap > 0 ? rawTwap : 0;
   const pool500 = telemetry.pools.find((p) => p.fee === 500);
-  const maxDepth2PctUsd = pool500?.approxDepth2PctUsd ?? 8.91;
+  const rawDepth2Pct = pool500?.approxDepth2PctUsd ?? 0;
+  const pool500Liq = parseNonNegativeBigInt(pool500?.liquidity);
+  const maxDepth2PctUsd =
+    Number.isFinite(rawDepth2Pct) && rawDepth2Pct > 0 && pool500Liq > 0n ? rawDepth2Pct : 0;
+  const hasLiquidity = hasLivePool && maxDepth2PctUsd > 0;
+  const oraclePriceValid = spotPrice > 0 && twapPrice > 0;
 
-  const emaFast = Number(computeEma(priceSeries, 9).toFixed(6));
-  const emaSlow = Number(computeEma(priceSeries, 21).toFixed(6));
-  const rsi14 = computeRsi(priceSeries, 14);
-  const bollingerZ = computeBollingerZ(priceSeries, 20);
-  const realizedVolPct = computeRealizedVolPct(priceSeries);
+  const emaFast = Number(computeEma(cleanSeries, 9).toFixed(6));
+  const emaSlow = Number(computeEma(cleanSeries, 21).toFixed(6));
+  const rsi14 = computeRsi(cleanSeries, 14);
+  const bollingerZ = computeBollingerZ(cleanSeries, 20);
+  const realizedVolPct = computeRealizedVolPct(cleanSeries);
   const regime = detectMarketRegime(emaFast, emaSlow, realizedVolPct, bollingerZ);
 
   const trendSpreadBps = emaSlow > 0 ? ((emaFast - emaSlow) / emaSlow) * 10_000 : 0;
@@ -321,11 +393,15 @@ export function evaluatePairSignal(
   let action: SignalAction = "HOLD";
   let confidence = 52;
   let expectedEdgeBps = 0;
-  let rationale = hasLivePool
-    ? "Holding USDT: no live dislocation clears fee and slippage thresholds."
-    : `Disabled: Factory.getPool(${pair}) returned address(0) on HSK Chain Mainnet (177).`;
+  let rationale = !hasLivePool
+    ? `Disabled: Factory.getPool(${pair}) returned address(0) on HSK Chain Mainnet (177).`
+    : !oraclePriceValid
+      ? "Blocked: non-finite or zero spot/TWAP price feed detected."
+      : !hasLiquidity
+        ? "Blocked: zero active liquidity depth on HSKSwap V3 0.05% pool."
+        : "Holding USDT: no live dislocation clears fee and slippage thresholds.";
 
-  if (hasLivePool) {
+  if (hasLivePool && oraclePriceValid && hasLiquidity) {
     if (
       vault.strategyMode === "MOMENTUM" ||
       (vault.strategyMode === "HYBRID" && (regime === "TRENDING_BULL" || regime === "TRENDING_BEAR"))
@@ -374,17 +450,46 @@ export function evaluatePairSignal(
 
   const appetiteScalar =
     vault.riskAppetite === "CONSERVATIVE" ? 0.55 : vault.riskAppetite === "AGGRESSIVE" ? 0.95 : 0.78;
-  const maxPositionUsd = (vault.balances.USDT * vault.policy.maxPositionBps) / 10_000;
-  const depthFloorUsd = Math.max(0.005, maxDepth2PctUsd);
+  const safeUsdtBal = Number.isFinite(vault.balances.USDT) && vault.balances.USDT > 0 ? vault.balances.USDT : 0;
+  const safeWhskBal = Number.isFinite(vault.balances.WHSK) && vault.balances.WHSK > 0 ? vault.balances.WHSK : 0;
+  const sourceBalanceUsd = action === "SELL" ? safeWhskBal * twapPrice : safeUsdtBal;
+  const clampedPosBps = Number.isFinite(vault.policy.maxPositionBps)
+    ? Math.max(0, Math.min(PROTOCOL_HARD_LIMITS.MAX_POSITION_BPS, vault.policy.maxPositionBps))
+    : 0;
+  const maxPositionUsd = (sourceBalanceUsd * clampedPosBps) / 10_000;
   const recommendedSizeUsd =
-    action === "HOLD" || !hasLivePool
+    action === "HOLD" || !hasLivePool || !hasLiquidity || !oraclePriceValid
       ? 0
-      : Number(Math.min(depthFloorUsd, maxPositionUsd * appetiteScalar).toFixed(4));
+      : floorToDecimals(Math.min(maxDepth2PctUsd, maxPositionUsd * appetiteScalar), 4);
 
-  const projectedVolume = vault.sessionVolumeUsedUsd + recommendedSizeUsd;
-  const oracleFresh = vault.oracleAgeSec <= vault.oracleMaxStalenessSec;
-  const twapAligned = telemetry.spotVsTwapDiffBps <= vault.oracleMaxDeviationBps;
-  const depthOk = recommendedSizeUsd <= depthFloorUsd + 1e-6;
+  const safeSessionUsed =
+    Number.isFinite(vault.sessionVolumeUsedUsd) && vault.sessionVolumeUsedUsd >= 0 ? vault.sessionVolumeUsedUsd : Infinity;
+  const safeSessionCap =
+    Number.isFinite(vault.sessionVolumeCapUsd) && vault.sessionVolumeCapUsd >= 0 ? vault.sessionVolumeCapUsd : 0;
+  const projectedVolume = safeSessionUsed + recommendedSizeUsd;
+
+  const oracleAgeValid =
+    Number.isFinite(vault.oracleAgeSec) &&
+    vault.oracleAgeSec >= 0 &&
+    Number.isFinite(vault.oracleMaxStalenessSec) &&
+    vault.oracleMaxStalenessSec > 0;
+  const oracleFresh = oraclePriceValid && oracleAgeValid && vault.oracleAgeSec <= vault.oracleMaxStalenessSec;
+  const twapAligned =
+    oraclePriceValid &&
+    Number.isFinite(telemetry.spotVsTwapDiffBps) &&
+    telemetry.spotVsTwapDiffBps >= 0 &&
+    Number.isFinite(vault.oracleMaxDeviationBps) &&
+    telemetry.spotVsTwapDiffBps <= vault.oracleMaxDeviationBps;
+  const depthOk = hasLiquidity && recommendedSizeUsd <= maxDepth2PctUsd + 1e-9;
+  const slippageValid =
+    Number.isFinite(vault.policy.maxSlippageBps) &&
+    vault.policy.maxSlippageBps > 0 &&
+    vault.policy.maxSlippageBps <= PROTOCOL_HARD_LIMITS.MAX_SLIPPAGE_BPS;
+  const drawdownValid =
+    Number.isFinite(vault.currentDrawdownBps) &&
+    vault.currentDrawdownBps >= 0 &&
+    Number.isFinite(vault.policy.dailyDrawdownCapBps) &&
+    vault.currentDrawdownBps < vault.policy.dailyDrawdownCapBps;
 
   const guardChecks: GuardCheck[] = [
     {
@@ -399,39 +504,44 @@ export function evaluatePairSignal(
     {
       name: "Protected TWAP Oracle Freshness",
       passed: oracleFresh && twapAligned,
-      detail: !oracleFresh
-        ? `STALE: ${vault.oracleAgeSec}s > ${vault.oracleMaxStalenessSec}s TTL`
-        : !twapAligned
-          ? `DIVERGED: spot vs TWAP ${telemetry.spotVsTwapDiffBps} bps > ${vault.oracleMaxDeviationBps} bps`
-          : `Fresh (${vault.oracleAgeSec}s / ${vault.oracleMaxStalenessSec}s) · Spot-TWAP Δ ${telemetry.spotVsTwapDiffBps.toFixed(1)} bps`,
+      detail: !oraclePriceValid
+        ? "INVALID: zero or non-finite oracle price"
+        : !oracleFresh
+          ? `STALE: ${vault.oracleAgeSec}s > ${vault.oracleMaxStalenessSec}s TTL`
+          : !twapAligned
+            ? `DIVERGED: spot vs TWAP ${telemetry.spotVsTwapDiffBps} bps > ${vault.oracleMaxDeviationBps} bps`
+            : `Fresh (${vault.oracleAgeSec}s / ${vault.oracleMaxStalenessSec}s) · Spot-TWAP Δ ${telemetry.spotVsTwapDiffBps.toFixed(1)} bps`,
     },
     {
       name: "Independent On-Chain Oracle Slippage Floor",
-      passed: vault.policy.maxSlippageBps > 0 && vault.policy.maxSlippageBps <= PROTOCOL_HARD_LIMITS.MAX_SLIPPAGE_BPS,
+      passed: slippageValid,
       detail: `Oracle minAmountOut floor guarded at ${vault.policy.maxSlippageBps} bps (1-wei attack blocked)`,
     },
     {
       name: "Daily Drawdown Stop-Loss (Pro-Rata)",
-      passed: vault.currentDrawdownBps < vault.policy.dailyDrawdownCapBps,
+      passed: drawdownValid,
       detail: `${(vault.currentDrawdownBps / 100).toFixed(2)}% used / ${(vault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap`,
     },
     {
       name: "Max Position & <=2% Pool Depth Cap",
-      passed: recommendedSizeUsd <= maxPositionUsd + 1e-6 && depthOk,
-      detail: `$${recommendedSizeUsd.toFixed(2)} <= min($${maxPositionUsd.toFixed(2)} cap, $${maxDepth2PctUsd.toFixed(2)} 2% depth)`,
+      passed: recommendedSizeUsd <= maxPositionUsd + 1e-9 && depthOk,
+      detail: !hasLiquidity
+        ? "BLOCKED: zero active pool liquidity"
+        : `$${recommendedSizeUsd.toFixed(2)} <= min($${maxPositionUsd.toFixed(2)} cap, $${maxDepth2PctUsd.toFixed(2)} 2% depth)`,
     },
     {
       name: "Trade Frequency & Cooldown (>=10s)",
       passed:
-        vault.secondsSinceLastTrade >= vault.policy.minTradeIntervalSec &&
+        Number.isFinite(vault.secondsSinceLastTrade) &&
+        vault.secondsSinceLastTrade >= Math.max(PROTOCOL_HARD_LIMITS.MIN_COOLDOWN_SEC, vault.policy.minTradeIntervalSec) &&
         vault.dailyTradeCount < vault.policy.maxDailyTrades,
       detail: `${vault.dailyTradeCount}/${vault.policy.maxDailyTrades} daily · ${vault.secondsSinceLastTrade}s / ${vault.policy.minTradeIntervalSec}s cooldown`,
     },
     {
       name: "Session Notional Budget & Live Pool",
-      passed: projectedVolume <= vault.sessionVolumeCapUsd && hasLivePool,
+      passed: Number.isFinite(projectedVolume) && projectedVolume <= safeSessionCap && hasLivePool,
       detail: hasLivePool
-        ? `$${projectedVolume.toFixed(2)} / $${vault.sessionVolumeCapUsd.toLocaleString()} · 0xEB33...778A live`
+        ? `$${projectedVolume.toFixed(2)} / $${safeSessionCap.toLocaleString()} · 0xEB33...778A live`
         : "BLOCKED: Factory.getPool returned address(0)",
     },
   ];
@@ -441,7 +551,7 @@ export function evaluatePairSignal(
   let intent: TradeIntentPayload | null = null;
   let intentDigest: string | null = null;
 
-  if (hasLivePool && action !== "HOLD" && recommendedSizeUsd > 0) {
+  if (hasLivePool && hasLiquidity && oraclePriceValid && slippageValid && action !== "HOLD" && recommendedSizeUsd > 0) {
     const whskToken = HASHKEY_MAINNET.tokens.WHSK;
     const usdtToken = HASHKEY_MAINNET.tokens.USDT;
 
@@ -450,8 +560,8 @@ export function evaluatePairSignal(
     const tokenOut = isBuy ? whskToken.address : usdtToken.address;
 
     const amountIn = isBuy
-      ? BigInt(Math.max(1, Math.round(recommendedSizeUsd * 10 ** usdtToken.decimals)))
-      : BigInt(Math.max(1, Math.round((recommendedSizeUsd / twapPrice) * 1e8))) * 10n ** 10n;
+      ? BigInt(Math.max(1, Math.floor(recommendedSizeUsd * 10 ** usdtToken.decimals + 1e-9)))
+      : BigInt(Math.max(1, Math.floor((recommendedSizeUsd / twapPrice) * 1e8 + 1e-9))) * 10n ** 10n;
 
     const expectedOutFloat = isBuy
       ? (recommendedSizeUsd / twapPrice) * 0.9995
@@ -460,11 +570,12 @@ export function evaluatePairSignal(
     const outDec = isBuy ? whskToken.decimals : usdtToken.decimals;
     const scaleHi = Math.min(outDec, 8);
     const expectedAmountOut =
-      BigInt(Math.max(1, Math.round(expectedOutFloat * 10 ** scaleHi))) *
+      BigInt(Math.max(1, Math.floor(expectedOutFloat * 10 ** scaleHi + 1e-9))) *
       10n ** BigInt(Math.max(0, outDec - scaleHi));
 
-    const minAmountOut =
-      (expectedAmountOut * BigInt(10_000 - vault.policy.maxSlippageBps)) / 10_000n;
+    const safeSlipBps = Math.max(1, Math.min(PROTOCOL_HARD_LIMITS.MAX_SLIPPAGE_BPS, Math.floor(vault.policy.maxSlippageBps)));
+    const rawMinOut = (expectedAmountOut * BigInt(10_000 - safeSlipBps)) / 10_000n;
+    const minAmountOut = rawMinOut > 0n ? rawMinOut : 1n;
 
     const strategyLabel = `HQ_${vault.strategyMode}_WHSK_USDT`;
     const signalHash = computeSignalHash({
@@ -490,7 +601,7 @@ export function evaluatePairSignal(
       amountIn,
       minAmountOut,
       expectedAmountOut,
-      maxSlippageBps: vault.policy.maxSlippageBps,
+      maxSlippageBps: safeSlipBps,
       deadline: BigInt(nowUnixSec + 300), // strictly <= 900s MAX_INTENT_DEADLINE_WINDOW
       nonce: BigInt(vault.nonce),
       strategyTag: hashStrategyTag(strategyLabel),
@@ -537,6 +648,22 @@ export function evaluateDecisionCycle(
   const pool3000 = telemetry.pools.find((p) => p.fee === 3000);
   const arb = scanArbitrageOpportunities(telemetry, vault.balances.USDT, vault.policy.maxPositionBps)[0];
 
+  const drawdownBreached =
+    vault.circuitBreakerTripped ||
+    !Number.isFinite(vault.currentDrawdownBps) ||
+    vault.currentDrawdownBps < 0 ||
+    vault.currentDrawdownBps >= vault.policy.dailyDrawdownCapBps;
+  const oracleStaleOrInvalid =
+    !Number.isFinite(vault.oracleAgeSec) ||
+    vault.oracleAgeSec < 0 ||
+    vault.oracleAgeSec > vault.oracleMaxStalenessSec ||
+    !Number.isFinite(telemetry.whskTwapUsdt) ||
+    telemetry.whskTwapUsdt <= 0;
+  const twapDiverged =
+    !Number.isFinite(telemetry.spotVsTwapDiffBps) ||
+    telemetry.spotVsTwapDiffBps < 0 ||
+    telemetry.spotVsTwapDiffBps > vault.oracleMaxDeviationBps;
+
   let verdict: DecisionVerdict = "HOLD";
   let reasonCode: AgentDecisionEntry["reasonCode"] = "SPREAD_BELOW_FEE_HURDLE";
   let evidence = arb.holdReason;
@@ -545,22 +672,33 @@ export function evaluateDecisionCycle(
     verdict = "GUARD_REJECT";
     reasonCode = "VAULT_PAUSED";
     evidence = "Vault paused by cold owner — all autonomous execution halted on-chain.";
-  } else if (vault.circuitBreakerTripped) {
+  } else if (drawdownBreached) {
     verdict = "GUARD_REJECT";
     reasonCode = "CIRCUIT_BREAKER_LATCHED";
     evidence = `Daily drawdown circuit breaker latched (${(vault.currentDrawdownBps / 100).toFixed(2)}% >= ${(vault.policy.dailyDrawdownCapBps / 100).toFixed(2)}% cap).`;
-  } else if (vault.oracleAgeSec > vault.oracleMaxStalenessSec) {
+  } else if (oracleStaleOrInvalid) {
     verdict = "GUARD_REJECT";
     reasonCode = "ORACLE_STALE";
-    evidence = `TWAP mark age ${vault.oracleAgeSec}s exceeds ${vault.oracleMaxStalenessSec}s TTL — refusing blind execution.`;
-  } else if (telemetry.spotVsTwapDiffBps > vault.oracleMaxDeviationBps) {
+    evidence =
+      !Number.isFinite(telemetry.whskTwapUsdt) || telemetry.whskTwapUsdt <= 0
+        ? "TWAP oracle price is zero or non-finite — refusing blind execution."
+        : `TWAP mark age ${vault.oracleAgeSec}s exceeds ${vault.oracleMaxStalenessSec}s TTL — refusing blind execution.`;
+  } else if (twapDiverged) {
     verdict = "GUARD_REJECT";
     reasonCode = "SPOT_TWAP_DIVERGENCE";
-    evidence = `Spot vs 5m TWAP diverged by ${telemetry.spotVsTwapDiffBps.toFixed(1)} bps (> ${vault.oracleMaxDeviationBps} bps cap).`;
+    evidence = `Spot vs 5m TWAP diverged by ${Number.isFinite(telemetry.spotVsTwapDiffBps) ? telemetry.spotVsTwapDiffBps.toFixed(1) : "NaN"} bps (> ${vault.oracleMaxDeviationBps} bps cap).`;
   } else if (vault.secondsSinceLastTrade < vault.policy.minTradeIntervalSec) {
     verdict = "HOLD";
     reasonCode = "COOLDOWN_ACTIVE";
     evidence = `Cooldown active (${vault.secondsSinceLastTrade}s elapsed / ${vault.policy.minTradeIntervalSec}s minimum).`;
+  } else if (!primarySignal.allGuardsPassed) {
+    verdict = "GUARD_REJECT";
+    reasonCode = "NO_SIGNAL_DISLOCATION";
+    const failed = primarySignal.guardChecks
+      .filter((g) => !g.passed)
+      .map((g) => `${g.name}: ${g.detail}`)
+      .join(" | ");
+    evidence = failed || primarySignal.rationale;
   } else if (vault.strategyMode === "ARBITRAGE" && !arb.executable) {
     verdict = "HOLD";
     reasonCode = "SPREAD_BELOW_FEE_HURDLE";
@@ -588,7 +726,7 @@ export function evaluateDecisionCycle(
     feeHurdleBps: arb.poolFeesBps,
     gasImpactBps: arb.gasImpactBps,
     netEdgeBps: arb.netEdgeBps,
-    maxDepth2PctUsd: pool500?.approxDepth2PctUsd ?? 8.91,
+    maxDepth2PctUsd: primarySignal.maxDepth2PctUsd,
     verdict,
     reasonCode,
     evidence,

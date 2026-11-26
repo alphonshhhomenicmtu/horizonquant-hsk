@@ -734,4 +734,426 @@ contract HorizonGuardVaultTest is TestBase {
             assertFalse(vault.circuitBreakerTripped(), "flag must remain clear");
         }
     }
+
+    // =========================================================================
+    // Expanded Security Hardening Regression & Fuzz Tests
+    // =========================================================================
+
+    function test_RevertOnZeroLockedAndUninitializedOraclePrice() public {
+        // Case A: zero sqrtPriceX96 in pool reverts sync
+        whskUsdtPool.setSqrtPriceX96(0, PARITY_WHSK_TICK);
+        vm.prank(keeper);
+        vm.expectRevert(HorizonGuardVault.ZeroAmount.selector);
+        vault.syncPriceFromV3Pool(address(whsk));
+
+        // Case B: locked V3 pool reverts sync with PoolLocked
+        whskUsdtPool.setSqrtPriceX96(PARITY_WHSK_SQRT_PRICE_X96, PARITY_WHSK_TICK);
+        whskUsdtPool.setUnlocked(false);
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(HorizonGuardVault.PoolLocked.selector, address(whskUsdtPool)));
+        vault.syncPriceFromV3Pool(address(whsk));
+        whskUsdtPool.setUnlocked(true);
+
+        // Case C: zero manual reference price override rejected
+        vm.prank(owner);
+        vm.expectRevert(HorizonGuardVault.ZeroAmount.selector);
+        vault.setReferencePrice(address(whsk), 0);
+
+        // Case D: uninitialized pool with observationCardinality == 0 rejected
+        MockUninitializedV3Pool uninitPool = new MockUninitializedV3Pool(
+            address(whsk),
+            address(usdt),
+            PARITY_WHSK_SQRT_PRICE_X96,
+            PARITY_WHSK_TICK,
+            LIVE_WHSK_USDT_LIQUIDITY
+        );
+        vm.prank(owner);
+        vault.setOraclePool(address(whsk), address(uninitPool), 300, 1_000, 3_600, 1_000_000_000_000);
+        vm.prank(keeper);
+        vm.expectRevert(HorizonGuardVault.InvalidOracleConfig.selector);
+        vault.syncPriceFromV3Pool(address(whsk));
+    }
+
+    function test_RevertOnRegisterQuoteTokenOverrideAndInvalidFee() public {
+        vm.startPrank(owner);
+        vm.expectRevert(HorizonGuardVault.InvalidOracleConfig.selector);
+        vault.registerToken(address(usdt), 18, 2e18);
+
+        vm.expectRevert(HorizonGuardVault.InvalidOracleConfig.selector);
+        vault.setAllowedPair(address(usdt), address(whsk), 1_000_000, true);
+
+        MockERC20 badDec = new MockERC20("BadDec", "BAD", 18);
+        vm.expectRevert(HorizonGuardVault.InvalidOracleConfig.selector);
+        vault.registerToken(address(badDec), 19, 1e18);
+        vm.stopPrank();
+
+        vm.expectRevert(HorizonGuardVault.InvalidOracleConfig.selector);
+        vault.quoteOracleMinAmountOut(address(usdt), address(whsk), 1_000_000, 1_000e6, 50);
+
+        assertEq(vault.referencePriceE18(address(usdt)), 1e18, "quote token price must remain pinned at 1e18");
+    }
+
+    function test_RevertOnRoleEscalationByAgentKeeperAndAttacker() public {
+        address[3] memory nonOwners = [agent, keeper, attacker];
+        HorizonGuardVault.RiskPolicy memory loosePolicy = HorizonGuardVault.RiskPolicy({
+            maxSlippageBps: 500,
+            maxPositionBps: 10_000,
+            dailyDrawdownCapBps: 2_500,
+            minTradeIntervalSec: 10,
+            maxDailyTrades: 100
+        });
+
+        for (uint256 i = 0; i < nonOwners.length; ++i) {
+            address actor = nonOwners[i];
+            vm.startPrank(actor);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setPaused(true);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.resetCircuitBreaker();
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.updateRiskPolicy(loosePolicy);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setAgentSessionKey(actor, uint64(block.timestamp + 1 days), 1_000_000e18);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setPriceKeeper(actor, true);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setOraclePool(address(whsk), address(whskUsdtPool), 300, 1_000, 3_600, 1);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setAllowedRouter(address(0xDEAD), true);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setAllowedPair(address(usdt), address(whsk), 100, true);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.setReferencePrice(address(whsk), 1e18);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.transferOwnership(actor);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.withdraw(address(usdt), 1e6, actor);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.emergencyWithdraw(address(usdt), actor);
+
+            vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+            vault.rescueNative(payable(actor));
+
+            if (actor != keeper) {
+                vm.expectRevert(HorizonGuardVault.Unauthorized.selector);
+                vault.syncPriceFromV3Pool(address(whsk));
+            }
+            vm.stopPrank();
+        }
+    }
+
+    function test_EmergencyPauseImmediatelyHaltsSwapAndUnpauseResumes() public {
+        HorizonGuardVault.TradeIntent memory intent = _buildDefaultUsdtToWhskIntent(5_000e6);
+        bytes memory sig = _signIntent(AGENT_PK, intent);
+
+        vm.prank(owner);
+        vault.setPaused(true);
+        assertTrue(vault.paused(), "vault must be paused");
+
+        vm.expectRevert(HorizonGuardVault.VaultIsPaused.selector);
+        vault.executeGuardedSwap(intent, sig);
+        assertEq(vault.nonces(agent), 0, "nonce must not advance while paused");
+
+        // Owner custody remains accessible while paused
+        vm.prank(owner);
+        vault.withdraw(address(usdt), 1_000e6, owner);
+        assertEq(usdt.balanceOf(address(vault)), 49_000e6, "owner withdraw allowed while paused");
+
+        // Unpause restores autonomous execution cleanly
+        vm.prank(owner);
+        vault.setPaused(false);
+        uint256 out = vault.executeGuardedSwap(intent, sig);
+        assertGe(out, intent.minAmountOut, "swap executes cleanly after unpause");
+        assertEq(vault.nonces(agent), 1, "nonce increments after unpause");
+    }
+
+    function test_DailyTradeCountHardCapAndUtcDayRolloverReset() public {
+        uint256 t0 = 1_764_000_000;
+        vm.prank(owner);
+        vault.updateRiskPolicy(
+            HorizonGuardVault.RiskPolicy({
+                maxSlippageBps: 50,
+                maxPositionBps: 2_500,
+                dailyDrawdownCapBps: 300,
+                minTradeIntervalSec: 10,
+                maxDailyTrades: 2
+            })
+        );
+
+        HorizonGuardVault.TradeIntent memory intent1 = _buildDefaultUsdtToWhskIntent(1_000e6);
+        intent1.deadline = t0 + 300;
+        vault.executeGuardedSwap(intent1, _signIntent(AGENT_PK, intent1));
+
+        vm.warp(t0 + 15);
+        HorizonGuardVault.TradeIntent memory intent2 = _buildDefaultUsdtToWhskIntent(1_000e6);
+        intent2.deadline = t0 + 315;
+        vault.executeGuardedSwap(intent2, _signIntent(AGENT_PK, intent2));
+        assertEq(vault.dailyTradeCount(), 2, "two trades recorded");
+
+        vm.warp(t0 + 30);
+        HorizonGuardVault.TradeIntent memory intent3 = _buildDefaultUsdtToWhskIntent(1_000e6);
+        intent3.deadline = t0 + 330;
+        bytes memory sig3 = _signIntent(AGENT_PK, intent3);
+        vm.expectRevert(abi.encodeWithSelector(HorizonGuardVault.MaxDailyTradesReached.selector, 2, 2));
+        vault.executeGuardedSwap(intent3, sig3);
+
+        // Roll into next UTC day, refresh TWAP oracle, verify counter resets cleanly
+        vm.warp(t0 + 1 days + 30);
+        vm.prank(keeper);
+        vault.syncPriceFromV3Pool(address(whsk));
+
+        HorizonGuardVault.TradeIntent memory intentNextDay = _buildDefaultUsdtToWhskIntent(1_000e6);
+        intentNextDay.deadline = t0 + 1 days + 330;
+        vault.executeGuardedSwap(intentNextDay, _signIntent(AGENT_PK, intentNextDay));
+        assertEq(vault.dailyTradeCount(), 1, "daily trade count resets on new UTC day");
+    }
+
+    function test_RevokedSessionKeyImmediatelyBlocksExecution() public {
+        HorizonGuardVault.TradeIntent memory intent = _buildDefaultUsdtToWhskIntent(2_000e6);
+        bytes memory sig = _signIntent(AGENT_PK, intent);
+
+        vm.prank(owner);
+        vault.revokeAgentSessionKey();
+
+        vm.expectRevert(HorizonGuardVault.SessionNotActive.selector);
+        vault.executeGuardedSwap(intent, sig);
+    }
+
+    function test_PreTradeDrawdownBreachRevertsBeforeSpendingFunds() public {
+        // Drop WHSK reference price from $0.10 to $0.088 => 3.428% drawdown (>= 3.00% cap)
+        // WITHOUT calling checkAndTripCircuitBreaker() first
+        vm.prank(owner);
+        vault.setReferencePrice(address(whsk), 0.088e18);
+        assertFalse(vault.circuitBreakerTripped(), "breaker flag not yet latched");
+
+        // Align pool TWAP to $0.088 so oracle check passes and pre-trade drawdown check triggers
+        whskUsdtPool.setSqrtPriceX96(23503651000000000000000, -300_629);
+        whskUsdtPool.setTwapTick(-300_629);
+
+        uint256 usdtBefore = usdt.balanceOf(address(vault));
+        HorizonGuardVault.TradeIntent memory intent = _buildDefaultUsdtToWhskIntent(2_000e6);
+        bytes memory sig = _signIntent(AGENT_PK, intent);
+
+        uint256 expectedDd = vault.currentDailyDrawdownBps();
+        vm.expectRevert(abi.encodeWithSelector(HorizonGuardVault.DailyDrawdownExceeded.selector, expectedDd, 300));
+        vault.executeGuardedSwap(intent, sig);
+
+        assertEq(usdt.balanceOf(address(vault)), usdtBefore, "no funds spent on pre-trade drawdown revert");
+        assertEq(usdt.allowance(address(vault), address(router)), 0, "no router allowance left");
+        assertEq(vault.nonces(agent), 0, "nonce untouched");
+    }
+
+    function test_ReadOnlyAndStateReentrancyBlockedDuringCallback() public {
+        ReentrantCallbackERC20 evilToken = new ReentrantCallbackERC20(vault);
+
+        vm.startPrank(owner);
+        vault.registerToken(address(evilToken), 18, 1e18);
+        evilToken.mint(owner, 1_000e18);
+        evilToken.approve(address(vault), type(uint256).max);
+        vault.deposit(address(evilToken), 500e18);
+        vm.stopPrank();
+
+        assertTrue(evilToken.navReentryReverted(), "read-only computeTotalNavE18 reentry must revert");
+        assertTrue(evilToken.drawdownReentryReverted(), "read-only currentDailyDrawdownBps reentry must revert");
+        assertTrue(evilToken.withdrawReentryReverted(), "state-mutating withdraw reentry must revert");
+    }
+
+    function test_BidirectionalWhskToUsdtSwapAndDirectionalSqrtPriceLimit() public {
+        uint256 amountInWhsk = 40_000e18; // 20% of 200,000 WHSK balance
+        (uint256 fairOut, uint256 minOut) =
+            vault.quoteOracleMinAmountOut(address(whsk), address(usdt), FEE_LOW, amountInWhsk, 50);
+
+        HorizonGuardVault.TradeIntent memory intent = HorizonGuardVault.TradeIntent({
+            router: address(router),
+            tokenIn: address(whsk),
+            tokenOut: address(usdt),
+            fee: FEE_LOW,
+            amountIn: amountInWhsk,
+            minAmountOut: minOut,
+            expectedAmountOut: fairOut,
+            maxSlippageBps: 50,
+            deadline: block.timestamp + 300,
+            nonce: vault.nonces(agent),
+            strategyTag: keccak256("HSK_ROTATE_TO_USDT"),
+            signalHash: keccak256("SELL_WHSK_SIGNAL")
+        });
+
+        uint256 outUsdt = vault.executeGuardedSwap(intent, _signIntent(AGENT_PK, intent));
+        assertGe(outUsdt, minOut, "WHSK->USDT output must satisfy oracle floor");
+        assertEq(whsk.allowance(address(vault), address(router)), 0, "zero residual WHSK router allowance");
+        assertGt(uint256(router.lastSqrtPriceLimitX96()), 4295128739, "sqrtPriceLimitX96 above MIN_SQRT_RATIO");
+        assertLt(
+            uint256(router.lastSqrtPriceLimitX96()),
+            uint256(PARITY_WHSK_SQRT_PRICE_X96),
+            "directional zeroForOne sqrtPriceLimitX96 must sit below spot"
+        );
+    }
+
+    function test_MaxTrackedTokensCeilingEnforced() public {
+        // Already tracked: USDT + WHSK = 2 tokens; register 14 more to reach MAX_TRACKED_TOKENS = 16
+        vm.startPrank(owner);
+        for (uint256 i = 2; i < 16; ++i) {
+            MockERC20 tok = new MockERC20("Extra", "EXT", 18);
+            vault.registerToken(address(tok), 18, 1e18);
+        }
+        assertEq(vault.getTrackedTokens().length, 16, "must reach MAX_TRACKED_TOKENS");
+
+        MockERC20 overflowTok = new MockERC20("Overflow", "OVF", 18);
+        vm.expectRevert(HorizonGuardVault.MaxTrackedTokensReached.selector);
+        vault.registerToken(address(overflowTok), 18, 1e18);
+        vm.stopPrank();
+    }
+
+    function testFuzz_MulDiv512BitNewtonRaphsonExact(
+        uint128 rawK,
+        uint128 rawM,
+        uint128 rawD,
+        uint128 rawR
+    ) public {
+        VaultMathHarness harness = new VaultMathHarness(owner, address(usdt), 6);
+        uint256 k = bound(rawK, 1 << 110, (1 << 124) - 1);
+        uint256 m = bound(rawM, 1 << 110, (1 << 124) - 1);
+        uint256 d = bound(rawD, 1 << 110, (1 << 124) - 1);
+        uint256 r = bound(rawR, 0, d - 1);
+
+        // a = k*d + r (< 2^249), b = m (< 2^124) => a*b > 2^256 (forces 512-bit Newton-Raphson path!)
+        uint256 a = k * d + r;
+        uint256 expected = k * m + (r * m) / d;
+        uint256 actual = harness.exposedMulDiv(a, m, d);
+        assertEq(actual, expected, "512-bit _mulDiv must match exact floor arithmetic");
+    }
+
+    function testFuzz_ProRataScalingPreservesDrawdownInvariant(
+        uint256 priceRaw,
+        uint256 flowRaw,
+        bool isDeposit
+    ) public {
+        uint256 shockedPrice = bound(priceRaw, 0.04e18, 0.098e18);
+        vm.prank(owner);
+        vault.setReferencePrice(address(whsk), shockedPrice);
+
+        uint256 ddBefore = vault.currentDailyDrawdownBps();
+        if (isDeposit) {
+            uint256 dep = bound(flowRaw, 100e6, 50_000e6);
+            usdt.mint(owner, dep);
+            vm.prank(owner);
+            vault.deposit(address(usdt), dep);
+        } else {
+            uint256 wd = bound(flowRaw, 100e6, 25_000e6);
+            vm.prank(owner);
+            vault.withdraw(address(usdt), wd, owner);
+        }
+
+        uint256 ddAfter = vault.currentDailyDrawdownBps();
+        // Because high-water baseline rounds UP on pro-rata scaling, drawdown never dilutes downward
+        assertGe(ddAfter, ddBefore, "pro-rata flow must never dilute existing drawdown");
+        assertLe(ddAfter, ddBefore + 1, "pro-rata flow must not distort drawdown by more than 1 bps rounding");
+    }
+}
+
+contract MockUninitializedV3Pool {
+    address public immutable token0;
+    address public immutable token1;
+    uint128 public immutable liquidity;
+    uint160 internal immutable _sqrtPriceX96;
+    int24 internal immutable _tick;
+
+    constructor(address t0, address t1, uint160 sqrtPriceX96_, int24 tick_, uint128 liq_) {
+        token0 = t0;
+        token1 = t1;
+        _sqrtPriceX96 = sqrtPriceX96_;
+        _tick = tick_;
+        liquidity = liq_;
+    }
+
+    function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (_sqrtPriceX96, _tick, 0, 0, 0, 0, true);
+    }
+}
+
+contract ReentrantCallbackERC20 {
+    HorizonGuardVault public immutable targetVault;
+    uint8 public constant decimals = 18;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    bool public navReentryReverted;
+    bool public drawdownReentryReverted;
+    bool public withdrawReentryReverted;
+
+    constructor(HorizonGuardVault vault_) {
+        targetVault = vault_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "INSUFFICIENT_BALANCE");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 allowed = allowance[from][msg.sender];
+        require(allowed >= amount, "INSUFFICIENT_ALLOWANCE");
+        if (allowed != type(uint256).max) {
+            allowance[from][msg.sender] = allowed - amount;
+        }
+        require(balanceOf[from] >= amount, "INSUFFICIENT_BALANCE");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+
+        if (to == address(targetVault)) {
+            try targetVault.computeTotalNavE18() {} catch {
+                navReentryReverted = true;
+            }
+            try targetVault.currentDailyDrawdownBps() {} catch {
+                drawdownReentryReverted = true;
+            }
+            try targetVault.withdraw(address(this), 1, msg.sender) {} catch {
+                withdrawReentryReverted = true;
+            }
+        }
+        return true;
+    }
+}
+
+contract VaultMathHarness is HorizonGuardVault {
+    constructor(address initialOwner, address quoteTokenAddress, uint8 quoteTokenDecimals)
+        HorizonGuardVault(
+            initialOwner,
+            quoteTokenAddress,
+            quoteTokenDecimals,
+            RiskPolicy({
+                maxSlippageBps: 50,
+                maxPositionBps: 2_500,
+                dailyDrawdownCapBps: 300,
+                minTradeIntervalSec: 60,
+                maxDailyTrades: 24
+            })
+        )
+    {}
+
+    function exposedMulDiv(uint256 a, uint256 b, uint256 denominator) external pure returns (uint256) {
+        return _mulDiv(a, b, denominator);
+    }
 }

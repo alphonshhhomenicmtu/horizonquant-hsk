@@ -228,10 +228,10 @@ export function VaultSecurityView({
                 HorizonGuardVault.sol — Red-Team Hardened Security Invariants
               </div>
               <div className="card-subtitle">
-                Solidity 0.8.29 (Cancun, via_ir, 20.1 KB runtime) · Foundry Unit + Fuzz + Stateful Invariant + Aderyn + Slither + Gitleaks
+                Solidity 0.8.29 (Cancun, via_ir, 20.5 KB runtime) · Foundry Unit + Fuzz + Stateful Invariant + Aderyn + Slither + Gitleaks
               </div>
             </div>
-            <span className="badge badge-emerald">28/28 Forge · 5 Invariants · 0 Leaks</span>
+            <span className="badge badge-emerald">40/40 Forge · 8 Invariants · 0 H/M Slither</span>
           </div>
 
           <div className="guard-list">
