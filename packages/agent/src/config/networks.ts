@@ -149,7 +149,36 @@ export const HASHKEY_TESTNET: NetworkConfig = {
   deployerAddress: "0x57A46E4E5F538452E4D672EF9D48e3e90E10A81C",
   deployedVaultAddress: null,
   estimatedDeployGasHsk: "0.05 - 0.15 HSK",
-  tokens: HASHKEY_MAINNET.tokens,
+  // Owned map. Do not alias HASHKEY_MAINNET.tokens: those are chain 177.
+  // Addresses are merchant-onboarding contracts from TECH_SPEC_20261128
+  // (hashkey-testnet / chain 133), not HSKChain token-page rows and not
+  // verified HSKSwap pool tokens. Pools stay empty until a live pool exists.
+  tokens: {
+    USDC: {
+      symbol: "USDC",
+      name: "USD Coin",
+      address: "0x8FE3cB719Ee4410E236Cd6b72ab1fCDC06eF53c6",
+      decimals: 6,
+      referenceUsd: 1.0,
+      hasLivePool: false,
+      poolStatusNote:
+        "Chain 133 merchant-onboarding USDC (EIP-3009) from TECH_SPEC_20261128. Not an HSKSwap pool token.",
+      explorerUrl:
+        "https://testnet-explorer.hskchain.net/address/0x8FE3cB719Ee4410E236Cd6b72ab1fCDC06eF53c6",
+    },
+    USDT: {
+      symbol: "USDT",
+      name: "Tether USD",
+      address: "0x372325443233fEbaC1F6998aC750276468c83CC6",
+      decimals: 6,
+      referenceUsd: 1.0,
+      hasLivePool: false,
+      poolStatusNote:
+        "Chain 133 merchant-onboarding USDT (Permit2) from TECH_SPEC_20261128. Not an HSKSwap pool token.",
+      explorerUrl:
+        "https://testnet-explorer.hskchain.net/address/0x372325443233fEbaC1F6998aC750276468c83CC6",
+    },
+  },
   pools: [],
 };
 
