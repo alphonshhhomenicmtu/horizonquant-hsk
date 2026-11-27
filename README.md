@@ -74,7 +74,7 @@ Every contract address and pool was probed live against `https://mainnet.hsk.xyz
 - **Public Agent Decision Ledger (Act vs Hold)**: Every RPC poll from `https://mainnet.hsk.xyz` appends a timestamped decision record showing live `0.05%` vs `0.30%` pool prices, 5-minute TWAP divergence, gross spread vs `35 bps` fee hurdle, 2% active liquidity depth, and exact numeric rationale for acting or holding.
 - **Interactive Adversarial Breaker Lab**: One-click exploit buttons (`1-Wei Slippage`, `Stale Oracle`, `Unauthorized Keeper / Fake Pool`, `+25% Spot Flash Spike`, `Oversized Position`) that display exact malicious ABI calldata, the 4-byte Solidity custom error selector, and run live `eth_call` verification when attached to a deployed vault.
 - **Real Wallet Execution + Live Vault Inspector**: Connect MetaMask / Rabby on `chainId 177` and attach any deployed vault (`?vault=0x...`) to read real balances, `policy()`, `session()`, and `ExecutionRecord[]`, sign real EIP-712 `TradeIntent` payloads, and broadcast transactions directly to HashKey Chain Mainnet. Pre-deploy local actions are explicitly marked `PAPER FILL`.
-- **Illustrative Stress Scenario Model**: Clearly labeled 30-day synthetic stress scenario comparing tail-risk drawdown and adverse slippage protection with vs without `HorizonGuardVault` (no synthetic historical Sharpe claims).
+- **Illustrative Stress Scenario Model**: Clearly labeled 30-day synthetic stress scenario comparing tail-risk drawdown and adverse slippage protection with vs without `HorizonGuardVault` (no synthetic historical Sharpe claims). Demo subtitles in `demo-video/horizonquant-demo.srt` match the suite above: **40/40 Foundry** and **40/40 Vitest**, with no NAV or Sharpe track record.
 
 ---
 
