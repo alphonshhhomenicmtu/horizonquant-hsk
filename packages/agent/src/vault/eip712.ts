@@ -58,6 +58,31 @@ export function buildVaultDomain(verifyingContract: Address, chainId = HASHKEY_M
   } as const;
 }
 
+/**
+ * Deterministic off-chain domain used only when no vault address is configured.
+ * Name, version, and verifyingContract differ from HorizonGuardVault and from the HSKSwap router.
+ */
+export const PAPER_GUARD_VERIFYING_CONTRACT =
+  "0x0000000000000000000000000000000000007171" as Address;
+
+export function buildPaperGuardDomain(chainId = HASHKEY_MAINNET.chainId) {
+  return {
+    name: "HorizonGuardPaper",
+    version: "paper",
+    chainId,
+    verifyingContract: PAPER_GUARD_VERIFYING_CONTRACT,
+  } as const;
+}
+
+export type IntentDomainMode = "vault" | "paper";
+
+export function resolveIntentDomain(vaultAddress: Address | null, chainId = HASHKEY_MAINNET.chainId) {
+  if (vaultAddress) {
+    return { mode: "vault" as const, domain: buildVaultDomain(vaultAddress, chainId) };
+  }
+  return { mode: "paper" as const, domain: buildPaperGuardDomain(chainId) };
+}
+
 export function hashStrategyTag(label: string): Hex {
   return keccak256(stringToHex(label));
 }
@@ -74,6 +99,23 @@ export function computeTradeIntentDigest(
 ): Hex {
   return hashTypedData({
     domain: buildVaultDomain(verifyingContract, chainId),
+    types: EIP712_TRADE_INTENT_TYPES,
+    primaryType: "TradeIntent",
+    message: intent,
+  });
+}
+
+export function computeTradeIntentDigestForDomain(
+  intent: TradeIntentPayload,
+  domain: {
+    name: string;
+    version: string;
+    chainId: number;
+    verifyingContract: Address;
+  },
+): Hex {
+  return hashTypedData({
+    domain,
     types: EIP712_TRADE_INTENT_TYPES,
     primaryType: "TradeIntent",
     message: intent,

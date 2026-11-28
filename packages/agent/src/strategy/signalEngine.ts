@@ -4,8 +4,9 @@ import type { ChainTelemetrySnapshot } from "../rpc/hskTelemetry.js";
 import {
   computeErrorSelector,
   computeSignalHash,
-  computeTradeIntentDigest,
+  computeTradeIntentDigestForDomain,
   encodeExecuteGuardedSwapCalldata,
+  resolveIntentDomain,
   encodeSyncPriceCalldata,
   hashStrategyTag,
   type RiskPolicyConfig,
@@ -71,6 +72,8 @@ export interface QuantSignal {
   allGuardsPassed: boolean;
   intent: TradeIntentPayload | null;
   intentDigest: string | null;
+  /** `vault` only when a concrete vault address is set. Never the HSKSwap router. */
+  intentDomain: "vault" | "paper";
 }
 
 export type DecisionVerdict = "ACT" | "HOLD" | "GUARD_REJECT";
@@ -592,7 +595,7 @@ export function evaluatePairSignal(
       blockNumber: telemetry.blockNumber,
     });
 
-    const verifyingContract = vault.vaultAddress ?? HASHKEY_MAINNET.hskSwapRouter;
+    const resolvedDomain = resolveIntentDomain(vault.vaultAddress, HASHKEY_MAINNET.chainId);
     intent = {
       router: HASHKEY_MAINNET.hskSwapRouter,
       tokenIn,
@@ -608,8 +611,10 @@ export function evaluatePairSignal(
       signalHash,
     };
 
-    intentDigest = computeTradeIntentDigest(intent, verifyingContract, HASHKEY_MAINNET.chainId);
+    intentDigest = computeTradeIntentDigestForDomain(intent, resolvedDomain.domain);
   }
+
+  const intentDomain = vault.vaultAddress ? "vault" : "paper";
 
   return {
     pair,
@@ -633,6 +638,7 @@ export function evaluatePairSignal(
     allGuardsPassed,
     intent,
     intentDigest,
+    intentDomain,
   };
 }
 
@@ -706,7 +712,11 @@ export function evaluateDecisionCycle(
   } else if (primarySignal.action !== "HOLD" && primarySignal.allGuardsPassed) {
     verdict = "ACT";
     reasonCode = "EXECUTABLE_SIGNAL";
-    evidence = `${primarySignal.action} $${primarySignal.recommendedSizeUsd.toFixed(2)} WHSK/USDT (${primarySignal.strategyMode}) · all 7 on-chain guards green · oracle floor armed at ${vault.policy.maxSlippageBps} bps.`;
+    const liveExecution = Boolean(vault.vaultAddress) && vault.isLiveOnChain;
+    const guardLabel = liveExecution
+      ? "all 7 on-chain guards green"
+      : "all 7 dry-run guards green (paper EIP-712 domain, no vault broadcast)";
+    evidence = `${primarySignal.action} $${primarySignal.recommendedSizeUsd.toFixed(2)} WHSK/USDT (${primarySignal.strategyMode}) · ${guardLabel} · oracle floor armed at ${vault.policy.maxSlippageBps} bps.`;
   } else {
     verdict = "HOLD";
     reasonCode = "NO_SIGNAL_DISLOCATION";
